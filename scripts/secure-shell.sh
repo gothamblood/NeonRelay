@@ -8,7 +8,11 @@
 # fournir la clé sans la laisser dans l'historique du shell :
 #
 #   NEONRELAY_KEY=... ./secure-shell.sh
-#   # ou :  nr_launch ~/.../scripts/secure-shell.sh <clé>   (voir base/_launch.sh)
+#
+#   # ou via nr_launch : c'est une FONCTION définie dans base/_launch.sh, il faut
+#   # donc SOURCER ce fichier UNE FOIS d'abord, sinon « nr_launch: command not found ».
+#   source base/_launch.sh                            # charge la fonction nr_launch
+#    nr_launch ~/.../scripts/secure-shell.sh <clé>    # espace en tête = hors historique
 #
 # Affichage :
 #   ← <msg>   message reçu (déchiffré) d'un expéditeur

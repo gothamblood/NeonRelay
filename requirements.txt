@@ -4,3 +4,6 @@ sqlalchemy[asyncio]>=2.1
 greenlet>=3.5
 aiosqlite>=0.20
 pydantic>=2.14
+
+# Canal chiffré de bout en bout, côté client (secure-shell.sh / relay.sh / stream.sh)
+pynacl>=1.5

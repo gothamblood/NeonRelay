@@ -1,4 +1,9 @@
-# NeonRelay
+<p align="center">
+  <img src="assets/spider_logo.png" alt="NeonRelay" width="160">
+</p>
+
+<h1 align="center">NeonRelay</h1>
+<p align="center"><em>Received, pushed, forgotten.</em></p>
 
 A **fire-and-forget** HTTP relay, in the spirit of Webhook.site but
 **backend-only** and **near-zero-retention**. Every box is a private inbox: you
