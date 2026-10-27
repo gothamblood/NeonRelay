@@ -1,0 +1,15 @@
+# Secrets & identifiants temporaires — NE JAMAIS committer
+admin-credentials.txt
+last-token.env
+*.env
+
+# Certificats TLS auto-signés (clé privée !) — NE JAMAIS committer
+*.pem
+
+# Bases SQLite (le registre de tokens vit à la racine)
+*.db
+
+# Python
+.venv/
+__pycache__/
+*.pyc

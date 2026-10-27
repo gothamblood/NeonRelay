@@ -1,0 +1,5 @@
+# Force LF sur les scripts et le code — sinon les éditeurs Windows cassent le shebang (bash\r)
+*.sh   text eol=lf
+*.py   text eol=lf
+*.txt  text eol=lf
+*.md   text eol=lf
