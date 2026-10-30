@@ -48,7 +48,13 @@ missing, bad or mismatched cert/key), it **aborts** instead of starting.
 ./scripts/launch.sh                                 # https://0.0.0.0:8000
 HOST=127.0.0.1 PORT=9000 ./scripts/launch.sh
 NEONRELAY_TLS_HOST=203.0.113.5 ./scripts/launch.sh  # add this IP/DNS to the cert
+NEONRELAY_TLS_ALG=rsa:2048 ./scripts/launch.sh      # legacy RSA cert (not post-quantum)
 ```
+
+The certificate is **ML-DSA-87** by default (post-quantum signature, NIST
+category 5). This requires **OpenSSL ≥ 3.5 on the server and on every client**;
+an older client fails the handshake. Key exchange is negotiated by OpenSSL as
+hybrid post-quantum `X25519MLKEM768`.
 
 On success it prints `✅ TLS enabled and functional`. Health check:
 `GET /healthz`. The interactive API docs (`/docs`, `/redoc`, `/openapi.json`)
