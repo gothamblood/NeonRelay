@@ -8,7 +8,9 @@ The password is deliberately NOT accepted in the URL query: a password in a URL
 leaks into server/proxy access logs, browser history and the Referer header
 (metadata that survives decryption), so that path is removed, not just
 discouraged. A token is only reachable by someone who holds BOTH the token id
-and its password; a wrong or missing password returns 401.
+and its password; a wrong or missing password returns 401, and so does an
+unknown token id -- same status, same body, same PBKDF2 cost -- so the API never
+reveals which token ids exist.
 """
 
 import base64
@@ -18,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_session
 from .models import Token
-from .security import verify_password
+from .security import DUMMY_HASH, verify_password
 
 _UNAUTHORIZED = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -52,20 +54,27 @@ def extract_password(request: Request) -> str | None:
     return None
 
 
+async def resolve_token(token_id: str, request: Request, session: AsyncSession) -> Token:
+    """Resolve a token by id and verify its password, or raise 401 (then 410).
+
+    An unknown id is indistinguishable from a wrong password: the password is
+    still run through PBKDF2 (against DUMMY_HASH) and the same 401 is raised.
+    """
+    token = await session.get(Token, token_id)
+    password = extract_password(request)
+    if not password:
+        raise _UNAUTHORIZED
+    stored = token.password_hash if token is not None else DUMMY_HASH
+    if not verify_password(password, stored) or token is None:
+        raise _UNAUTHORIZED
+    ensure_live(token)
+    return token
+
+
 async def authenticate_token(
     token_id: str,
     request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> Token:
-    """Resolve a token by id and verify its password, or raise 401/404."""
-    token = await session.get(Token, token_id)
-    if token is None:
-        # Same 401 as a bad password would be ideal to avoid leaking which
-        # tokens exist, but a 404 is friendlier for a dev tool. Choose 404.
-        raise HTTPException(status_code=404, detail="Token not found.")
-
-    password = extract_password(request)
-    if not password or not verify_password(password, token.password_hash):
-        raise _UNAUTHORIZED
-    ensure_live(token)
-    return token
+    """FastAPI dependency wrapping resolve_token."""
+    return await resolve_token(token_id, request, session)

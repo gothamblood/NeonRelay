@@ -37,3 +37,9 @@ def verify_password(password: str, stored: str) -> bool:
         "sha256", password.encode("utf-8"), salt, settings.PBKDF2_ITERATIONS
     )
     return hmac.compare_digest(candidate, expected)
+
+
+# Hash of a random secret nobody knows, computed once at startup. A password
+# sent for an unknown token id is checked against it, so that path costs the
+# same PBKDF2 as a wrong password and its timing can't reveal which ids exist.
+DUMMY_HASH = hash_password(secrets.token_urlsafe(32))

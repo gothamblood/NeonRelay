@@ -13,24 +13,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..auth import ensure_live, extract_password
+from ..auth import resolve_token
 from ..config import settings
 from ..database import get_session
 from ..events import broker, stash
 from ..logging_setup import log_action
-from ..models import Token
 from ..ratelimit import limiter
-from ..security import verify_password
 
 router = APIRouter(prefix="/relay", tags=["relay"])
 
 _METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
-
-_UNAUTHORIZED = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="Missing or invalid token password.",
-    headers={"WWW-Authenticate": 'Basic realm="NeonRelay"'},
-)
 
 
 # Anonymity is the whole point: a listener must never learn WHO sent a request.
@@ -65,16 +57,9 @@ def _stash_payload(event: dict, raw: bytes) -> str:
 
 
 async def _handle(token_id: str, subpath: str, request: Request, session: AsyncSession):
-    token = await session.get(Token, token_id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="Token not found.")
-
-    password = extract_password(request)
-    if not password or not verify_password(password, token.password_hash):
-        raise _UNAUTHORIZED
-
-    # TTL: reject a token whose lifetime has elapsed.
-    ensure_live(token)
+    # Unknown id, missing or wrong password -> the same 401 (see resolve_token);
+    # then TTL: a token whose lifetime has elapsed -> 410.
+    token = await resolve_token(token_id, request, session)
 
     # Anti-spam: spend one token-bucket credit; over the limit -> 429 with a
     # Retry-After that grows (1s, 2s, 4s, ...) the more the token is abused. We

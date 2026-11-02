@@ -31,7 +31,7 @@ if [ "$VERBOSE" = 1 ]; then
   echo "(send a request from another terminal; Ctrl+C to stop / envoie une requête depuis un autre terminal ; Ctrl+C pour arrêter)"
   echo
 fi
-# -f = échoue sur une erreur HTTP (401/404…) pour déclencher le message ci-dessous ;
+# -f = échoue sur une erreur HTTP (401/410…) pour déclencher le message ci-dessous ;
 # -N = pas de buffer (le flux SSE pousse chaque requête à son arrivée) ;
 # -S = affiche les erreurs malgré -s (sinon un serveur injoignable sort en silence).
 # Le lecteur (base/_stream_reader.py) n'affiche QUE le corps de chaque requête,
