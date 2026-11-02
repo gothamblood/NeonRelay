@@ -17,12 +17,8 @@ if [ -z "${NEONRELAY_BASE:-}" ] && [ -f "$CREDS" ]; then
 fi
 BASE="${NEONRELAY_BASE:-https://localhost:8000}"   # serveur toujours en TLS
 
-# Épinglage du cert auto-signé (défaut cert.pem à la racine) pour curl.
-_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-if [ -z "${NEONRELAY_CACERT:-}" ] && [ -f "$_ROOT/cert.pem" ]; then
-  NEONRELAY_CACERT="$_ROOT/cert.pem"
-fi
-[ -n "${NEONRELAY_CACERT:-}" ] && export CURL_CA_BUNDLE="$NEONRELAY_CACERT"
+# Épinglage du cert auto-signé + ML-KEM obligatoire pour curl (voir base/_tls.sh).
+source "$(dirname "$0")/base/_tls.sh"
 
 # -f : code ≠ 0 si HTTP ≥ 400 ; -S : montre l'erreur ; --max-time : ne pas traîner.
 body="$(curl -fsS --max-time 5 "$BASE/healthz" 2>/dev/null)" || {

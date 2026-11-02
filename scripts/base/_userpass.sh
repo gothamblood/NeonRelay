@@ -15,14 +15,8 @@
 # dessus), pour retrouver admin-credentials.txt quel que soit le CWD.
 _NEONRELAY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# TLS auto-signé : épinglage du cert serveur pour tous les curl. Défaut = cert.pem
-# à la racine (généré par launch.sh), sinon ce qui est dans NEONRELAY_CACERT.
-if [ -z "${NEONRELAY_CACERT:-}" ] && [ -f "$_NEONRELAY_ROOT/cert.pem" ]; then
-  NEONRELAY_CACERT="$_NEONRELAY_ROOT/cert.pem"
-fi
-if [ -n "${NEONRELAY_CACERT:-}" ]; then
-  export NEONRELAY_CACERT CURL_CA_BUNDLE="$NEONRELAY_CACERT"
-fi
+# TLS : épinglage du cert + ML-KEM obligatoire pour tous les curl (voir _tls.sh).
+source "$_NEONRELAY_ROOT/scripts/base/_tls.sh"
 
 neonrelay_load_admin() {
   local admin_file="${NEONRELAY_ADMIN_CREDS_FILE:-$_NEONRELAY_ROOT/admin-credentials.txt}"

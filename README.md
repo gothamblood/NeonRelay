@@ -53,8 +53,24 @@ NEONRELAY_TLS_ALG=rsa:2048 ./scripts/launch.sh      # legacy RSA cert (not post-
 
 The certificate is **ML-DSA-87** by default (post-quantum signature, NIST
 category 5). This requires **OpenSSL ≥ 3.5 on the server and on every client**;
-an older client fails the handshake. Key exchange is negotiated by OpenSSL as
-hybrid post-quantum `X25519MLKEM768`.
+an older client fails the handshake.
+
+The key exchange is **post-quantum and mandatory**: TLS 1.3 only, groups
+`SecP384r1MLKEM1024` (ML-KEM-1024, category 5) first, then `X25519MLKEM768` as
+fallback. A client offering no ML-KEM group (e.g. `X25519` only) or TLS 1.2 is
+refused. Uvicorn/Python cannot set TLS groups, so this is done with a
+process-local OpenSSL config, [`scripts/base/openssl-tls.cnf`](scripts/base/openssl-tls.cnf),
+loaded through `OPENSSL_CONF` — never the system-wide `openssl.cnf`:
+
+- **server**: `launch.sh` exports it; under systemd, add
+  `Environment=OPENSSL_CONF=/path/to/openssl.cnf` (e.g. via `systemctl edit`);
+- **clients**: the helper scripts export it too ([`scripts/base/_tls.sh`](scripts/base/_tls.sh)),
+  so curl **and** Python negotiate ML-KEM-1024. Override the file with
+  `NEONRELAY_OPENSSL_CONF`.
+
+Check it: `openssl s_client -connect host:8000 -CAfile cert.pem -groups X25519`
+must fail; `-groups SecP384r1MLKEM1024` must show
+`Negotiated TLS1.3 group: SecP384r1MLKEM1024`.
 
 On success it prints `✅ TLS enabled and functional`. Health check:
 `GET /healthz`. The interactive API docs (`/docs`, `/redoc`, `/openapi.json`)

@@ -23,12 +23,6 @@ BASE="${NEONRELAY_BASE:-https://localhost:8000}"
 TOKEN="${NEONRELAY_TOKEN:?Set NEONRELAY_TOKEN / Définis NEONRELAY_TOKEN (run token.sh / source last-token.env)}"
 PW="${NEONRELAY_PW:?Set NEONRELAY_PW / Définis NEONRELAY_PW (run token.sh / source last-token.env)}"
 
-# TLS auto-signé : on épingle le cert du serveur. Par défaut on prend cert.pem à
-# la racine du projet (généré par launch.sh) ; curl l'utilise via CURL_CA_BUNDLE,
-# donc tous les appels curl des scripts en profitent sans option supplémentaire.
-if [ -z "${NEONRELAY_CACERT:-}" ] && [ -f "$_NEONRELAY_ROOT/cert.pem" ]; then
-  NEONRELAY_CACERT="$_NEONRELAY_ROOT/cert.pem"
-fi
-if [ -n "${NEONRELAY_CACERT:-}" ]; then
-  export NEONRELAY_CACERT CURL_CA_BUNDLE="$NEONRELAY_CACERT"
-fi
+# TLS : épinglage du cert + ML-KEM obligatoire, pour tous les curl/Python des
+# scripts sans option supplémentaire (voir _tls.sh).
+source "$_NEONRELAY_ROOT/scripts/base/_tls.sh"

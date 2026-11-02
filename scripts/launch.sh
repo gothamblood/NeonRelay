@@ -83,5 +83,10 @@ echo "Clients : NEONRELAY_BASE=https://<hôte>:$PORT  NEONRELAY_CACERT=$CERT"
 echo "(Ctrl+C to stop / pour arrêter)"
 echo
 
+# TLS 1.3 + échange de clés ML-KEM obligatoire (SecP384r1MLKEM1024 puis
+# X25519MLKEM768), comme en prod. Uvicorn/Python ne règlent pas les groupes TLS :
+# on passe par une config OpenSSL propre au process (jamais le openssl.cnf global).
+export OPENSSL_CONF="${NEONRELAY_OPENSSL_CONF:-$ROOT/scripts/base/openssl-tls.cnf}"
+
 exec "$VENV/bin/uvicorn" app.main:app --host "$HOST" --port "$PORT" --reload \
   --ssl-keyfile "$KEY" --ssl-certfile "$CERT"
