@@ -1,20 +1,34 @@
 ﻿<#
   NeonRelay — installation du client Windows (une seule fois, sans droits administrateur).
 
-  Lancer : double-clic sur install.cmd
-     ou : powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+  Deux façons de le lancer :
+    - AMORÇAGE (cas normal) : le Digispark tape une commande qui télécharge ce
+      script, vérifie son SHA-256 contre l'empreinte gravée dans la clé, puis
+      l'exécute avec -Source URL. Le client n'a jamais le dossier client\.
+    - LOCAL (opérateur) : double-clic sur install.cmd, ou
+      powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
   Ce que fait ce script, dans %LOCALAPPDATA%\NeonRelay :
     1. télécharge le Python OFFICIEL (python.org, « embeddable », OpenSSL 3.5 :
-       ML-DSA-87 + ML-KEM) et PyNaCl + ses dépendances (PyPI) ;
-    2. vérifie l'empreinte SHA-256 de CHAQUE téléchargement (fixée ci-dessous)
-       et la signature Authenticode de python.exe (Python Software Foundation) ;
-    3. copie neonrelay.py + openssl-tls.cnf (dossier client\, parent de celui-ci) ;
-    4. ajoute « neonrelay » au PATH de l'utilisateur : Win+R → neonrelay.
+       ML-DSA-87 + ML-KEM) et PyNaCl + cffi (PyPI) ;
+    2. récupère neonrelay.py + openssl-tls.cnf (depuis -Source, sinon depuis
+       le dossier parent client\) ;
+    3. vérifie l'empreinte SHA-256 de CHAQUE fichier (fixée ci-dessous) et la
+       signature Authenticode de python.exe (Python Software Foundation) ;
+    4. ajoute « neonrelay » au PATH de l'utilisateur.
+
+  Chaîne de confiance : empreinte de CE fichier (dans la clé) → empreintes
+  ci-dessous → chaque fichier installé. Après toute modification de
+  neonrelay.py ou openssl-tls.cnf : client/epingler.sh.
 
   Rien n'est installé dans le système, aucune clé de registre n'est créée.
   Désinstaller : uninstall.cmd.
 #>
+param(
+  # URL du dossier client (contient neonrelay.py et openssl-tls.cnf), sans « / » final.
+  # Vide = copie locale depuis le dossier parent de ce script.
+  [string]$Source = ''
+)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # la barre de progression ralentit énormément les téléchargements
 
@@ -57,10 +71,20 @@ $Wheels = @(
 # pycparser n'est PAS installé : il ne sert qu'à compiler des modules cffi, or
 # PyNaCl est livré précompilé (prouvé sous Linux, T-17 ; vérifié ci-dessous).
 
+# Le client lui-même. Empreintes mises à jour par client/epingler.sh.
+$ClientFiles = @(
+  @{ Name = 'neonrelay.py'; Sha256 = '53d0dbc960678b3644c87207b4c410e79668123f2f06579fc69cc82c3753a373' },
+  @{ Name = 'openssl-tls.cnf'; Sha256 = '40fcb1b909e540eae22417442fa6e081ac6eff53d14d72cfbe43362a398de2ad' }
+)
+
 function Get-Verified($Item, $Dir) {
   $out = Join-Path $Dir $Item.Name
   Write-Host "  - $($Item.Name)"
-  Invoke-WebRequest -Uri $Item.Url -OutFile $out -UseBasicParsing
+  if ($Item.Url) {
+    Invoke-WebRequest -Uri $Item.Url -OutFile $out -UseBasicParsing
+  } else {
+    Copy-Item -LiteralPath $Item.Path -Destination $out
+  }
   $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $out).Hash.ToLowerInvariant()
   if ($hash -ne $Item.Sha256) {
     throw "Empreinte SHA-256 inattendue pour $($Item.Name) : téléchargement altéré, installation annulée."
@@ -68,19 +92,27 @@ function Get-Verified($Item, $Dir) {
   return $out
 }
 
-foreach ($f in 'neonrelay.py', 'openssl-tls.cnf') {
-  if (-not (Test-Path -LiteralPath (Join-Path $Here $f))) {
-    throw "$f introuvable dans $Here : garde le dossier client complet (client\windows\install.cmd + client\$f)."
+$Source = $Source.TrimEnd('/')
+foreach ($c in $ClientFiles) {
+  if ($Source) {
+    $c.Url = "$Source/$($c.Name)"
+  } else {
+    $c.Path = Join-Path $Here $c.Name
+    if (-not (Test-Path -LiteralPath $c.Path)) {
+      throw "$($c.Name) introuvable dans $Here : garde le dossier client complet (client\windows\install.cmd + client\$($c.Name))."
+    }
   }
 }
 
-Write-Host 'NeonRelay — installation du client'
+Write-Host 'NeonRelay — première utilisation : installation du client (1 à 2 minutes).'
+Write-Host 'Ne touche à rien : la clé fait tout. Chaque fichier est vérifié avant usage.'
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('neonrelay-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
   Write-Host 'Téléchargement (empreintes SHA-256 vérifiées) :'
   $pyZip = Get-Verified $Python $tmp
   $wheelFiles = foreach ($w in $Wheels) { Get-Verified $w $tmp }
+  $clientPaths = foreach ($c in $ClientFiles) { Get-Verified $c $tmp }
 
   if (Test-Path -LiteralPath $Py) { Remove-Item -LiteralPath $Py -Recurse -Force }
   New-Item -ItemType Directory -Force -Path $Py, $Bin | Out-Null
@@ -100,7 +132,7 @@ try {
     Expand-Archive -LiteralPath $zip -DestinationPath $Py -Force
   }
 
-  Copy-Item -LiteralPath (Join-Path $Here 'neonrelay.py'), (Join-Path $Here 'openssl-tls.cnf') -Destination $Dest -Force
+  Copy-Item -LiteralPath $clientPaths -Destination $Dest -Force
 
   Set-Content -LiteralPath (Join-Path $Bin 'neonrelay.cmd') -Encoding ASCII -Value @(
     '@echo off',
@@ -119,8 +151,12 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Le Python installé ne démarre pas correctement.' }
 
   Write-Host ''
-  Write-Host 'Installé. Branche le Digispark (ou Win+R → neonrelay, puis colle la clé).'
-  Write-Host 'Si Win+R ne trouve pas « neonrelay », ferme la session Windows et rouvre-la.'
+  if ($Source) {
+    Write-Host 'Installé. Lancement du client…'   # l'amorçage enchaîne sur neonrelay.cmd
+  } else {
+    Write-Host 'Installé. Branche le Digispark (ou Win+R → neonrelay, puis colle la clé).'
+    Write-Host 'Si Win+R ne trouve pas « neonrelay », ferme la session Windows et rouvre-la.'
+  }
 }
 finally {
   Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
