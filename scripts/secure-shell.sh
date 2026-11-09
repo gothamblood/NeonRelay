@@ -14,6 +14,11 @@
 #   source base/_launch.sh                            # charge la fonction nr_launch
 #    nr_launch ~/.../scripts/secure-shell.sh <clé>    # espace en tête = hors historique
 #
+# PIN optionnel (même calcul que client/neonrelay.py, les deux se lisent) :
+# invite masquée au démarrage ; Entrée seule ou 7 s sans toucher = sans PIN.
+# Avec PIN, la clé est dérivée une fois (Argon2id) et gardée en RAM
+# (NEONRELAY_E2E) ; un message envoyé sans le bon PIN s'affiche « illisible ».
+#
 # Affichage :
 #   ← <msg>   message reçu (déchiffré) d'un expéditeur
 #   → <msg>   invite de saisie ; ce que tu tapes est chiffré puis relayé
@@ -37,6 +42,9 @@ fi
 source "$HERE/base/_token.sh"
 source "$HERE/base/_crypto.sh"
 nr_crypto_check || exit 1
+
+# PIN optionnel (même calcul que le client autonome : les deux se lisent).
+nr_pin_setup || exit 1
 
 echo "🔒 Canal chiffré sur la boîte / Encrypted channel on box $TOKEN"
 echo "   → $BASE/relay/$TOKEN/hook"

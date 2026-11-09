@@ -1,5 +1,6 @@
 # Secrets & identifiants temporaires — NE JAMAIS committer
 admin-credentials.txt
+/commands
 last-token.env
 *.env
 

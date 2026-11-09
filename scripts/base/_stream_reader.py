@@ -9,6 +9,7 @@ Lancé par stream.sh en bout de pipe :  curl ... | python3 _stream_reader.py
 _crypto.py vit dans le même dossier, donc `import _crypto` le trouve.
 """
 import json
+import os
 import sys
 
 import _crypto
@@ -28,7 +29,11 @@ def main():
             try:
                 clear = _crypto.decrypt(obj["body_text"].encode("utf-8"))
             except _crypto.DecryptError as exc:
-                print(f"[message illisible / unreadable: {exc}]", flush=True)
+                if os.environ.get("NEONRELAY_E2E"):
+                    # PIN actif : un message illisible a été envoyé sans le bon PIN.
+                    print("⚠️  [message illisible : envoyé sans le bon PIN — intrus possible]", flush=True)
+                else:
+                    print(f"[message illisible / unreadable: {exc}]", flush=True)
                 continue
             # Le clair déchiffré peut être binaire : on décode au mieux.
             print(clear.decode("utf-8", "replace"), flush=True)
