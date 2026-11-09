@@ -69,7 +69,7 @@ CFFI_SHA_aarch64='507a24c282e0f42f8ed737cf048572cbf580468da5555764a8331735e9c736
 # PyNaCl est livré précompilé (testé : SecretBox + Argon2id fonctionnent sans).
 
 # Le client lui-même. Empreintes mises à jour par client/epingler.sh.
-NEONRELAY_PY_SHA='53d0dbc960678b3644c87207b4c410e79668123f2f06579fc69cc82c3753a373'
+NEONRELAY_PY_SHA='5d59aa458fc558e82ed56c597b2061a00664d7d8e14a041d6f873231c1ede5fc'
 OPENSSL_CNF_SHA='40fcb1b909e540eae22417442fa6e081ac6eff53d14d72cfbe43362a398de2ad'
 
 # --- Chemins ---------------------------------------------------------------------

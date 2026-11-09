@@ -779,6 +779,15 @@ def _read_masked(prompt: str, timeout: float) -> tuple[str, bool]:
     if os.name == "nt":
         import msvcrt
 
+        # Vider ce que le Digispark a tapé EN AVANCE (notamment l'Entrée qui a
+        # validé la clé) : sans ça, cette touche résiduelle satisfait l'invite
+        # dès son affichage et le PIN est sauté en silence (("", False), donc pas
+        # même le message « Délai écoulé »). Côté Linux, _read_key lit la clé en
+        # ICANON et consomme déjà le saut de ligne : rien ne traîne.
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):  # touche spéciale : code sur 2 lectures
+                msvcrt.getwch()
         deadline = time.monotonic() + timeout
         while True:
             if msvcrt.kbhit():

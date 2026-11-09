@@ -3,3 +3,8 @@
 *.py   text eol=lf
 *.txt  text eol=lf
 *.md   text eol=lf
+*.cnf  text eol=lf
+# install.ps1 est haché par make-key (gravé dans la clé) puis vérifié contre le
+# blob LF servi par GitHub : sans eol=lf, un clone Windows (autocrlf) le mettrait
+# en CRLF et le hash gravé ne correspondrait jamais.
+*.ps1  text eol=lf
