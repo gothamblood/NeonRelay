@@ -5,6 +5,7 @@ and no route-ordering hazard:
   * /relay/{token}/...  -- senders push traffic here
   * /listen/{token}     -- owner streams it live (also flushes a held __stash)
   * /config/...         -- owner creates and manages tokens
+  * /channel/{token}    -- noisy channel: constant-size, constant-rate frames
 """
 
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ from .admin import ensure_admin
 from .config import settings
 from .database import init_db
 from .logging_setup import configure_logging, log_action
-from .routes import capture, tokens
+from .routes import capture, channel, tokens
 
 
 @asynccontextmanager
@@ -51,3 +52,5 @@ app.include_router(tokens.config_router)  # /config/...
 app.include_router(tokens.listen_router)  # /listen/...
 # Sender-side relay: where incoming traffic is captured.
 app.include_router(capture.router)  # /relay/...
+# Noisy channel: fixed-size frames at a fixed pace, both directions.
+app.include_router(channel.router)  # /channel/...

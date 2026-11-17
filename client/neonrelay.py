@@ -17,10 +17,13 @@ Usage :
                                         #  le Digispark Windows installe le client si absent)
     python neonrelay.py claviers        # dispositions de clavier prises en charge
 
-Compatibilité : SANS PIN, même chiffrement que scripts/base/_crypto.py
-(SecretBox, clé = SHA-256 de la passphrase, nonce + chiffré en base64), donc ce
-client parle avec secure-shell.sh sur la même boîte. AVEC PIN, la clé E2E vient
-d'Argon2id (voir « PIN optionnel ») : seuls les clients qui ont le PIN se lisent.
+Canal bruité (/channel, format de trame v2) : une trame de 512 octets toutes
+les 0,2 s dans chaque sens, vraie ou fausse, chiffrée XSalsa20-Poly1305 puis
+AES-256-GCM (voir « Trames du canal bruité »). Le serveur complète la voie
+descendante par de l'aléatoire. scripts/secure-shell.sh utilise ce même code
+(scripts/base/_channel.py importe ce fichier) : les deux se parlent. SANS PIN,
+clé E2E = SHA-256 de la passphrase ; AVEC PIN, elle vient d'Argon2id (voir
+« PIN optionnel ») : seuls les clients qui ont le PIN se lisent.
 
 Prérequis : Python avec OpenSSL ≥ 3.5 (ML-DSA-87 + ML-KEM) et PyNaCl.
 """
@@ -37,6 +40,7 @@ if os.path.isfile(_TLS_CNF):
 
 import argparse  # noqa: E402
 import base64  # noqa: E402
+import collections  # noqa: E402
 import getpass  # noqa: E402
 import hashlib  # noqa: E402
 import hmac  # noqa: E402
@@ -667,30 +671,127 @@ def _check_keyboard(clavier: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Chiffrement de bout en bout (identique à scripts/base/_crypto.py)
+# Chiffrement de bout en bout : trames du canal bruité (format v2)
+#
+# Chaque trame fait FRAME_BYTES = 512 octets sur le fil, vraie ou fausse :
+#   nonce AES (12) | AES-256-GCM(K2)( nonce XSalsa (24) | XSalsa20-Poly1305(K1)(clair) | tag (16) ) | tag AES (16)
+# Clair (444 octets) = version(1) | drapeaux(1) | id du message(8) | n°(2) | total(2)
+#                      | longueur(2) | morceau du message (428 max) | remplissage à zéro
+# Drapeau 0x01 = fausse trame (bruit chiffré). Le marqueur est DANS le chiffré :
+# le serveur et le réseau ne voient que 512 octets aléatoires, comme pour une
+# vraie trame. K1 et K2 sont tirées de la clé E2E (SHA-256 ou Argon2id, voir
+# « PIN optionnel ») par BLAKE2b avec deux étiquettes différentes : deux clés
+# indépendantes pour deux familles de chiffrement (il faudrait casser les deux).
+# Même code pour scripts/secure-shell.sh (scripts/base/_channel.py importe ce
+# fichier) : les deux se parlent.
 # ---------------------------------------------------------------------------
 
-
-def _secretbox(passphrase: str, token: str = "", pin: str = ""):
-    try:
-        from nacl.secret import SecretBox
-    except ImportError:
-        raise SystemExit("PyNaCl manque : réinstalle le client (install.cmd).")
-    return SecretBox(e2e_key(passphrase, token, pin))
-
-
-def encrypt(box, text: str) -> bytes:
-    return base64.b64encode(box.encrypt(text.encode("utf-8")))
+FRAME_BYTES = 512
+TICK = 0.2
+FRAME_VERSION = 2
+_FRAME_AAD = b"neonrelay-frame-v2"
+_HDR = struct.Struct(">BB8sHHH")
+_PLAIN_BYTES = FRAME_BYTES - 12 - 16 - 24 - 16   # 444
+PAYLOAD_MAX = _PLAIN_BYTES - _HDR.size           # 428
+MAX_MESSAGE_FRAMES = 64
+_FLAG_FAKE = 0x01
 
 
-def decrypt(box, token: str):
-    """Texte en clair, ou None si le message ne se déchiffre pas avec cette clé."""
-    from nacl.exceptions import CryptoError
+class FrameCodec:
+    """Scelle / ouvre les trames de 512 octets (XSalsa20-Poly1305 puis AES-256-GCM)."""
 
-    try:
-        return box.decrypt(base64.b64decode(token)).decode("utf-8", "replace")
-    except (CryptoError, ValueError, TypeError):
-        return None
+    def __init__(self, e2e: bytes):
+        try:
+            from nacl import bindings
+            from nacl._sodium import lib
+            from nacl.secret import SecretBox
+        except ImportError:
+            raise SystemExit("PyNaCl manque : réinstalle le client.")
+        if not hasattr(bindings, "crypto_aead_aes256gcm_encrypt") or not lib.crypto_aead_aes256gcm_is_available():
+            raise SystemExit("AES-256-GCM indisponible (processeur sans AES matériel, "
+                             "ou PyNaCl < 1.6) : canal refusé.")
+        if len(e2e) != 32:
+            raise ValueError("clé E2E de 32 octets attendue")
+        k1 = hashlib.blake2b(key=e2e, digest_size=32, person=b"nr-k1-xsalsa").digest()
+        self._k2 = hashlib.blake2b(key=e2e, digest_size=32, person=b"nr-k2-aes256gcm").digest()
+        self._box = SecretBox(k1)
+        self._aes_enc = bindings.crypto_aead_aes256gcm_encrypt
+        self._aes_dec = bindings.crypto_aead_aes256gcm_decrypt
+
+    def _seal(self, plain: bytes) -> bytes:
+        inner = bytes(self._box.encrypt(plain))
+        nonce = os.urandom(12)
+        frame = nonce + self._aes_enc(inner, _FRAME_AAD, nonce, self._k2)
+        if len(frame) != FRAME_BYTES:
+            raise AssertionError("taille de trame inattendue")
+        return frame
+
+    @staticmethod
+    def _plain(flags: int, msg_id: bytes, seq: int, total: int, chunk: bytes = b"") -> bytes:
+        head = _HDR.pack(FRAME_VERSION, flags, msg_id, seq, total, len(chunk))
+        return head + chunk + bytes(_PLAIN_BYTES - len(head) - len(chunk))
+
+    def fake(self) -> bytes:
+        """Fausse trame : chiffrée comme une vraie, marquée « fake » à l'intérieur."""
+        return self._seal(self._plain(_FLAG_FAKE, os.urandom(8), 0, 0))
+
+    def message(self, text: str) -> list:
+        """Découpe un message en trames de taille fixe."""
+        data = text.encode("utf-8")
+        chunks = [data[i:i + PAYLOAD_MAX] for i in range(0, len(data), PAYLOAD_MAX)] or [b""]
+        if len(chunks) > MAX_MESSAGE_FRAMES:
+            raise ValueError(f"message trop long ({MAX_MESSAGE_FRAMES * PAYLOAD_MAX} octets max)")
+        msg_id = os.urandom(8)
+        return [self._seal(self._plain(0, msg_id, i, len(chunks), c)) for i, c in enumerate(chunks)]
+
+    def open(self, frame: bytes):
+        """(fausse, id, n°, total, morceau), ou None : bruit du serveur, autre clé
+        ou PIN, trame altérée. Dans tous ces cas : rejet silencieux."""
+        from nacl.exceptions import CryptoError
+
+        if len(frame) != FRAME_BYTES:
+            return None
+        try:
+            inner = self._aes_dec(frame[12:], _FRAME_AAD, frame[:12], self._k2)
+            plain = self._box.decrypt(inner)
+        except (CryptoError, ValueError, TypeError):
+            return None
+        if len(plain) != _PLAIN_BYTES:
+            return None
+        version, flags, msg_id, seq, total, length = _HDR.unpack_from(plain)
+        if version != FRAME_VERSION or length > PAYLOAD_MAX:
+            return None
+        return bool(flags & _FLAG_FAKE), msg_id, seq, total, plain[_HDR.size:_HDR.size + length]
+
+
+class Reassembler:
+    """Regroupe les morceaux par id de message ; oublie un message incomplet après TTL."""
+
+    TTL = 120.0
+    MAX_PENDING = 64
+
+    def __init__(self) -> None:
+        self._parts: dict = {}
+
+    def add(self, msg_id: bytes, seq: int, total: int, chunk: bytes):
+        now = time.monotonic()
+        for k in [k for k, (t, _, _) in self._parts.items() if now - t > self.TTL]:
+            del self._parts[k]
+        if not 1 <= total <= MAX_MESSAGE_FRAMES or seq >= total:
+            return None
+        entry = self._parts.get(msg_id)
+        if entry is None:
+            if len(self._parts) >= self.MAX_PENDING:
+                return None
+            entry = self._parts[msg_id] = (now, total, {})
+        _, expected, parts = entry
+        if expected != total:
+            return None
+        parts[seq] = chunk
+        if len(parts) < total:
+            return None
+        del self._parts[msg_id]
+        return b"".join(parts[i] for i in range(total)).decode("utf-8", "replace")
 
 
 # ---------------------------------------------------------------------------
@@ -883,45 +984,102 @@ def _http_error(status: int) -> str:
     }.get(status, f"erreur HTTP {status}")
 
 
-def send(key: Key, box, text: str) -> None:
+_SESSION_HEADER = "X-NeonRelay-Session"
+SILENCE_ALERT = 30.0   # s sans trame valide avant l'alerte locale
+
+
+def _channel_headers(key: Key, sid: str) -> dict:
+    # sid : identifiant aléatoire de CETTE session, le même sur les deux
+    # connexions, pour que le serveur ne nous renvoie pas nos propres trames.
+    return {_PW_HEADER: key.password, _SESSION_HEADER: sid}
+
+
+def _read_exact(resp, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        part = resp.read(n - len(buf))
+        if not part:
+            raise ConnectionError("flux fermé par le serveur")
+        buf += part
+    return buf
+
+
+def _channel_down(key: Key, sid: str, on_frame, on_ready) -> None:
+    """Voie descendante : le serveur écrit des trames à chaque tic (vraies + bruit)."""
     conn = connect(key)
     try:
-        conn.request(
-            "POST",
-            f"/relay/{key.token}/hook",
-            body=encrypt(box, text),
-            headers={_PW_HEADER: key.password, "Content-Type": "text/plain"},
-        )
+        conn.request("GET", f"/channel/{key.token}", headers=_channel_headers(key, sid))
         resp = conn.getresponse()
-        resp.read()
-        if resp.status >= 300:
+        if resp.status != 200:
             raise RuntimeError(_http_error(resp.status))
+        # Le serveur écrit toutes les TICK secondes : un long silence = lien mort.
+        conn.sock.settimeout(15)
+        on_ready()
+        while True:
+            on_frame(_read_exact(resp, FRAME_BYTES))
     finally:
         conn.close()
 
 
-def _listen_once(key: Key, on_message, on_ready) -> None:
-    """on_message reçoit le corps chiffré (base64) de chaque message."""
+class Outbox:
+    """Trames à envoyer. Vide => une fausse trame part à la place : le débit montant
+    ne dépend jamais de ce que tu écris."""
+
+    def __init__(self, codec: FrameCodec) -> None:
+        self._codec = codec
+        self._q: collections.deque = collections.deque()
+        self._lock = threading.Lock()
+
+    def put(self, frames: list) -> None:
+        with self._lock:
+            self._q.extend(frames)
+
+    def take(self) -> tuple:
+        with self._lock:
+            if self._q:
+                return self._q.popleft(), True
+        return self._codec.fake(), False
+
+    def give_back(self, frame: bytes) -> None:
+        with self._lock:
+            self._q.appendleft(frame)
+
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._q)
+
+
+def _channel_up(key: Key, sid: str, outbox: Outbox, stop: threading.Event) -> None:
+    """Voie montante : UNE requête chunked, une trame de 512 octets par tic."""
     conn = connect(key)
     try:
-        conn.request("GET", f"/listen/{key.token}", headers={_PW_HEADER: key.password})
-        resp = conn.getresponse()
-        if resp.status != 200:
-            raise RuntimeError(_http_error(resp.status))
-        conn.sock.settimeout(None)  # flux SSE : on attend aussi longtemps qu'il faut
-        on_ready()
-        while True:
-            line = resp.readline()
-            if not line:
-                raise ConnectionError("flux fermé par le serveur")
-            if not line.startswith(b"data:"):
-                continue
+        conn.putrequest("POST", f"/channel/{key.token}", skip_accept_encoding=True)
+        for name, value in _channel_headers(key, sid).items():
+            conn.putheader(name, value)
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.endheaders()
+        head = b"%X\r\n" % FRAME_BYTES
+        next_tick = time.monotonic()
+        while not stop.is_set():
+            frame, real = outbox.take()
             try:
-                event = json.loads(line[5:].strip())
-            except ValueError:
-                continue
-            if "body_text" in event:
-                on_message(event["body_text"])
+                conn.send(head + frame + b"\r\n")
+            except Exception:
+                if real:
+                    outbox.give_back(frame)  # renvoyée après reconnexion
+                raise
+            next_tick += TICK
+            delay = next_tick - time.monotonic()
+            if delay > 0:
+                stop.wait(delay)
+            else:
+                next_tick = time.monotonic()  # retard : on se recale, sans rafale
+        try:
+            conn.send(b"0\r\n\r\n")
+            conn.getresponse().read()
+        except (OSError, http.client.HTTPException):
+            pass
     finally:
         conn.close()
 
@@ -936,75 +1094,128 @@ def _say(text: str) -> None:
     sys.stdout.flush()
 
 
-def run_channel(key: Key, pin: str = "") -> int:
-    if pin:
-        print("   Dérivation de la clé (Argon2id)…", flush=True)
-    box = _secretbox(key.passphrase, key.token, pin)
-    mode = "AVEC PIN" if pin else "SANS PIN"
+def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
+    """Ouvre le canal bruité. e2e : clé déjà dérivée (scripts bash, PIN compris) ;
+    sinon elle est dérivée ici de la passphrase et du PIN."""
+    with_pin = bool(pin) or e2e is not None
+    if e2e is None:
+        if pin:
+            print("   Dérivation de la clé (Argon2id)…", flush=True)
+        e2e = e2e_key(key.passphrase, key.token, pin)
+    codec = FrameCodec(e2e)
+    mode = "AVEC PIN" if with_pin else "SANS PIN"
     print(f"🔒 Canal chiffré {mode} — boîte {key.token[:8]}… sur {key.host}:{key.port}")
-    if pin:
-        unreadable = "⚠️  [message illisible : envoyé sans le bon PIN — intrus possible]"
-    else:
-        print("   Sans PIN, les messages protégés par un PIN s'affichent illisibles.")
-        unreadable = "[message illisible : protégé par un PIN, autre passphrase ou altéré]"
+    print((f"   Trafic constant : une trame de {FRAME_BYTES} octets toutes les "
+          f"{TICK:g} s dans chaque sens, que tu parles ou non.").replace("0.", "0,"))
+    if not with_pin:
+        print("   Sans PIN, tu ne lis pas les correspondants qui ont un PIN (et inversement).")
     print("   Tape un message puis Entrée pour l'envoyer ; Ctrl+C pour quitter.\n")
 
-    def show(token: str) -> None:
-        text = decrypt(box, token)
-        _say(f"← {text}" if text is not None else unreadable)
-
+    sid = secrets.token_hex(16)
+    outbox = Outbox(codec)
+    reasm = Reassembler()
     stop = threading.Event()
     ready = threading.Event()
     fatal: list[str] = []
+    state = {"last_valid": 0.0, "online": False, "since": time.monotonic(), "told_alone": False}
+    lock = threading.Lock()
 
-    def listener() -> None:
+    def on_frame(frame: bytes) -> None:
+        opened = codec.open(frame)
+        if opened is None:
+            return  # bruit du serveur, autre clé/PIN, ou trame altérée : rejet silencieux
+        fake, msg_id, seq, total, chunk = opened
+        with lock:
+            state["last_valid"] = time.monotonic()
+            if not state["online"]:
+                state["online"] = True
+                _say("🟢 un correspondant est en ligne (même clé, même PIN)")
+        if fake:
+            return  # bruit d'un correspondant : il sert de battement de cœur
+        text = reasm.add(msg_id, seq, total, chunk)
+        if text is not None:
+            _say(f"← {text}")
+
+    def supervise() -> None:
+        # Alerte LOCALE uniquement (rien n'est envoyé) : un silence peut vouloir
+        # dire « personne en ligne », ou « clé / PIN différents ».
+        while not stop.wait(5):
+            now = time.monotonic()
+            with lock:
+                if state["online"] and now - state["last_valid"] > SILENCE_ALERT:
+                    state["online"] = False
+                    _say(f"⚪ aucune trame lisible depuis {SILENCE_ALERT:g} s : correspondant "
+                         "parti, ou clé / PIN différents")
+                elif (not state["online"] and not state["told_alone"]
+                        and now - state["since"] > SILENCE_ALERT and not state["last_valid"]):
+                    state["told_alone"] = True
+                    _say("⏳ aucun correspondant pour l'instant (ou clé / PIN différents) ; "
+                         "tes messages partent quand même")
+
+    def run_with_retry(target, name: str) -> None:
         delay = 2
         while not stop.is_set():
             try:
-                _listen_once(key, show, ready.set)
-            except CertError as exc:
+                target()
+            except (CertError, RuntimeError) as exc:  # cert inattendu, 401 / 410 : inutile d'insister
                 fatal.append(str(exc))
                 ready.set()
-                return
-            except RuntimeError as exc:  # 401 / 410 : inutile d'insister
-                fatal.append(str(exc))
-                ready.set()
+                stop.set()
                 return
             except (OSError, ConnectionError, http.client.HTTPException):
+                if stop.is_set():
+                    return
                 if not ready.is_set():
                     fatal.append("serveur injoignable")
                     ready.set()
                     return
-                _say(f"⚠️  écoute coupée, reconnexion dans {delay} s…")
+                _say(f"⚠️  {name} coupée, reconnexion dans {delay} s…")
                 if stop.wait(delay):
                     return
                 delay = min(delay * 2, 60)
             else:
                 delay = 2
 
-    threading.Thread(target=listener, daemon=True).start()
+    threading.Thread(target=run_with_retry, daemon=True, name="down",
+                     args=(lambda: _channel_down(key, sid, on_frame, ready.set), "réception")).start()
     ready.wait(20)
-    if fatal:
-        print(f"❌ {fatal[0]}")
+    if fatal or not ready.is_set():
+        print(f"❌ {fatal[0] if fatal else 'serveur injoignable'}")
+        stop.set()
         return 1
+    up = threading.Thread(target=run_with_retry, daemon=True, name="up",
+                          args=(lambda: _channel_up(key, sid, outbox, stop), "émission"))
+    up.start()
+    threading.Thread(target=supervise, daemon=True, name="supervise").start()
 
     try:
-        while True:
+        while not stop.is_set():
             text = input("→ ")
+            if fatal:
+                break
             if not text:
                 continue
             try:
-                send(key, box, text)
-            except CertError as exc:
-                print(f"❌ {exc}")
-                return 1
-            except (RuntimeError, OSError, http.client.HTTPException) as exc:
+                frames = codec.message(text)
+            except ValueError as exc:
                 print(f"⚠️  non envoyé : {exc}")
+                continue
+            outbox.put(frames)
+            if len(frames) > 1:
+                print(f"   (envoi en {len(frames)} trames, environ {len(frames) * TICK:.1f} s)")
     except (KeyboardInterrupt, EOFError):
-        print("\nCanal fermé.")
-        return 0
+        pass
     finally:
         stop.set()
+        up.join(2)
+    if fatal:
+        print(f"\n❌ {fatal[0]}")
+        return 1
+    left = outbox.pending()
+    if left:
+        print(f"\n⚠️  {left} trame(s) non envoyée(s).")
+    print("\nCanal fermé.")
+    return 0
 
 
 def _read_key(prompt: str) -> str:

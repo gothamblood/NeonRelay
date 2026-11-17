@@ -48,6 +48,22 @@ class Settings:
     # token behaves again. Punishes sustained abuse without a permanent ban.
     RATE_RETRY_MAX: float = float(os.getenv("NEONRELAY_RATE_RETRY_MAX", 600))
 
+    # Canal bruité (/channel) : trames de taille fixe, à rythme fixe, dans les
+    # deux sens. Un client envoie 1 trame par tic ; le serveur en renvoie SLOTS
+    # par tic à chaque auditeur (les trames en attente, complétées par de
+    # l'aléatoire). Bande passante descendante par client :
+    # SLOTS x FRAME_BYTES / TICK (défaut 2 x 512 / 0,2 s = 5 Kio/s).
+    # FRAME_BYTES doit rester égal à celui des clients (format de trame v2).
+    CHANNEL_FRAME_BYTES: int = int(os.getenv("NEONRELAY_CHANNEL_FRAME_BYTES", 512))
+    CHANNEL_TICK: float = float(os.getenv("NEONRELAY_CHANNEL_TICK", 0.2))
+    CHANNEL_SLOTS: int = int(os.getenv("NEONRELAY_CHANNEL_SLOTS", 2))
+    # Trames en attente par auditeur avant d'en jeter (auditeur trop lent).
+    CHANNEL_QUEUE_FRAMES: int = int(os.getenv("NEONRELAY_CHANNEL_QUEUE_FRAMES", 200))
+    # Débit montant toléré par boîte, toutes sessions confondues (trames/s) :
+    # au-delà, la connexion montante est coupée (429).
+    CHANNEL_FRAME_RATE: float = float(os.getenv("NEONRELAY_CHANNEL_FRAME_RATE", 20))
+    CHANNEL_FRAME_BURST: float = float(os.getenv("NEONRELAY_CHANNEL_FRAME_BURST", 40))
+
     # PBKDF2 iterations for password hashing.
     PBKDF2_ITERATIONS: int = int(os.getenv("NEONRELAY_PBKDF2_ITERATIONS", 200_000))
 
