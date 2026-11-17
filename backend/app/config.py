@@ -63,6 +63,12 @@ class Settings:
     # au-delà, la connexion montante est coupée (429).
     CHANNEL_FRAME_RATE: float = float(os.getenv("NEONRELAY_CHANNEL_FRAME_RATE", 20))
     CHANNEL_FRAME_BURST: float = float(os.getenv("NEONRELAY_CHANNEL_FRAME_BURST", 40))
+    # Plafonds par boîte : flux descendants (auditeurs) et montants (émetteurs)
+    # simultanés. Au-delà : 429 et connexion fermée. Une boîte sert à quelques
+    # correspondants ; sans plafond, un seul mot de passe de boîte suffirait à
+    # ouvrir des centaines de flux (bande passante et mémoire du serveur).
+    CHANNEL_MAX_LISTENERS: int = int(os.getenv("NEONRELAY_CHANNEL_MAX_LISTENERS", 8))
+    CHANNEL_MAX_SENDERS: int = int(os.getenv("NEONRELAY_CHANNEL_MAX_SENDERS", 8))
 
     # PBKDF2 iterations for password hashing.
     PBKDF2_ITERATIONS: int = int(os.getenv("NEONRELAY_PBKDF2_ITERATIONS", 200_000))

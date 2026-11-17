@@ -70,5 +70,33 @@ class Stash:
         return token_id in self._slots
 
 
+class Revocations:
+    """Boîtes supprimées pendant que des flux sont ouverts (canal, /listen).
+
+    L'authentification n'a lieu qu'à l'ouverture d'un flux : sans ce registre,
+    un flux ouvert survivrait à la suppression de sa boîte. Chaque flux consulte
+    ce registre (et l'expiration de la boîte) à chaque tic et se ferme aussitôt.
+    En mémoire seulement ; une entrée est oubliée après une heure (les ids de
+    boîte ne sont jamais réutilisés, et les flux se ferment en quelques secondes).
+    """
+
+    _KEEP = 3600.0
+
+    def __init__(self) -> None:
+        self._ids: dict[str, float] = {}
+
+    def revoke(self, token_id: str) -> None:
+        import time
+
+        now = time.monotonic()
+        for k in [k for k, t in self._ids.items() if now - t > self._KEEP]:
+            del self._ids[k]
+        self._ids[token_id] = now
+
+    def is_revoked(self, token_id: str) -> bool:
+        return token_id in self._ids
+
+
 broker = EventBroker()
 stash = Stash()
+revocations = Revocations()

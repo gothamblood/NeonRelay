@@ -38,6 +38,7 @@ from starlette.requests import ClientDisconnect
 from ..auth import resolve_token
 from ..config import settings
 from ..database import SessionLocal
+from ..events import revocations
 from ..logging_setup import log_action
 from ..ratelimit import RateLimiter
 
@@ -58,6 +59,23 @@ class ChannelBroker:
 
     def __init__(self) -> None:
         self._subs: dict[str, dict[str, asyncio.Queue]] = {}
+        self._senders: dict[str, set[str]] = {}
+
+    def listening(self, token_id: str, session: str) -> bool:
+        return session in self._subs.get(token_id, {})
+
+    def listeners(self, token_id: str) -> int:
+        return len(self._subs.get(token_id, {}))
+
+    def senders(self, token_id: str) -> set[str]:
+        return self._senders.setdefault(token_id, set())
+
+    def drop_sender(self, token_id: str, session: str) -> None:
+        s = self._senders.get(token_id)
+        if s is not None:
+            s.discard(session)
+            if not s:
+                del self._senders[token_id]
 
     def subscribe(self, token_id: str, session: str) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=settings.CHANNEL_QUEUE_FRAMES)
@@ -87,6 +105,12 @@ class ChannelBroker:
 channel_broker = ChannelBroker()
 
 
+def _refuse(code: int, detail: str) -> HTTPException:
+    # Connection: close -> uvicorn ferme la connexion TCP après la réponse : un
+    # client refusé ne peut pas continuer à pousser des octets que l'on lirait.
+    return HTTPException(status_code=code, detail=detail, headers={"Connection": "close"})
+
+
 def _session_id(request: Request) -> str:
     sid = request.headers.get(_SESSION_HEADER, "").strip().lower()
     if not _SESSION_RE.match(sid):
@@ -105,6 +129,13 @@ async def _authenticate(token_id: str, request: Request):
 async def channel_down(token_id: str, request: Request):
     sid = _session_id(request)
     token = await _authenticate(token_id, request)
+    # Vérifications et inscription sans « await » entre elles : atomiques pour
+    # la boucle asyncio (pas de course entre deux connexions simultanées).
+    if channel_broker.listening(token.id, sid):
+        raise _refuse(status.HTTP_409_CONFLICT, "Session already listening.")
+    if channel_broker.listeners(token.id) >= settings.CHANNEL_MAX_LISTENERS:
+        log_action("channel.down.refused", token=token.id, reason="cap")
+        raise _refuse(status.HTTP_429_TOO_MANY_REQUESTS, "Too many listeners for this box.")
     queue = channel_broker.subscribe(token.id, sid)
     frame, slots, tick = settings.CHANNEL_FRAME_BYTES, settings.CHANNEL_SLOTS, settings.CHANNEL_TICK
     log_action("channel.down.start", token=token.id)
@@ -115,6 +146,8 @@ async def channel_down(token_id: str, request: Request):
             while True:
                 if await request.is_disconnected():
                     break
+                if token.is_expired() or revocations.is_revoked(token.id):
+                    break  # boîte expirée ou supprimée : le flux se ferme au tic suivant
                 out = bytearray()
                 for _ in range(slots):
                     try:
@@ -143,22 +176,34 @@ async def channel_down(token_id: str, request: Request):
 async def channel_up(token_id: str, request: Request):
     sid = _session_id(request)
     token = await _authenticate(token_id, request)
+    senders = channel_broker.senders(token.id)
+    if sid in senders:
+        raise _refuse(status.HTTP_409_CONFLICT, "Session already sending.")
+    if len(senders) >= settings.CHANNEL_MAX_SENDERS:
+        log_action("channel.up.refused", token=token.id, reason="cap")
+        raise _refuse(status.HTTP_429_TOO_MANY_REQUESTS, "Too many senders for this box.")
+    senders.add(sid)
     size = settings.CHANNEL_FRAME_BYTES
     buf = bytearray()
     log_action("channel.up.start", token=token.id)
     reason = "closed"
     try:
         async for chunk in request.stream():
+            if token.is_expired() or revocations.is_revoked(token.id):
+                reason = "revoked"
+                return Response(status_code=status.HTTP_410_GONE, headers={"Connection": "close"})
             buf += chunk
             while len(buf) >= size:
                 frame = bytes(buf[:size])
                 del buf[:size]
                 if frame_limiter.check(token.id):
                     reason = "throttled"
-                    return Response(status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+                    return Response(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                                    headers={"Connection": "close"})
                 channel_broker.publish(token.id, frame, sid)
     except ClientDisconnect:
         pass
     finally:
+        channel_broker.drop_sender(token.id, sid)
         log_action("channel.up.stop", token=token.id, reason=reason)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

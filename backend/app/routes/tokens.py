@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..admin import require_admin
 from ..auth import authenticate_token
 from ..database import get_session
-from ..events import broker, stash
+from ..events import broker, revocations, stash
 from ..logging_setup import log_action
 from ..models import Token
 from ..ratelimit import limiter
@@ -87,6 +87,7 @@ async def delete_token(
     await session.commit()
     stash.clear(token.id)
     limiter.forget(token.id)
+    revocations.revoke(token.id)  # ferme les flux déjà ouverts (canal, /listen)
     log_action("token.delete")
 
 
@@ -122,15 +123,24 @@ async def stream_requests(
         # Deliver the held (stashed) message first, exactly like a live request.
         if held is not None:
             yield f"event: request\ndata: {held}\n\n"
+        idle = 0.0
         try:
             while True:
                 if await request.is_disconnected():
                     break
+                if token.is_expired() or revocations.is_revoked(token.id):
+                    break  # boîte expirée ou supprimée : on ferme le flux
                 try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    # Réveil chaque seconde pour vérifier la révocation ; le
+                    # keep-alive reste toutes les 15 s.
+                    payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    idle = 0.0
                     yield f"event: request\ndata: {payload}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"
+                    idle += 1.0
+                    if idle >= 15.0:
+                        idle = 0.0
+                        yield ": keep-alive\n\n"
         finally:
             broker.unsubscribe(token.id, queue)
             log_action("listen.stop")

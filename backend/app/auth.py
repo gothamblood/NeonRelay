@@ -13,6 +13,7 @@ unknown token id -- same status, same body, same PBKDF2 cost -- so the API never
 reveals which token ids exist.
 """
 
+import asyncio
 import base64
 
 from fastapi import Depends, HTTPException, Request, status
@@ -65,7 +66,10 @@ async def resolve_token(token_id: str, request: Request, session: AsyncSession) 
     if not password:
         raise _UNAUTHORIZED
     stored = token.password_hash if token is not None else DUMMY_HASH
-    if not verify_password(password, stored) or token is None:
+    # PBKDF2 hors de la boucle asyncio : sinon chaque essai (même sans mot de
+    # passe valide) fige tout le serveur, y compris le rythme du canal bruité.
+    # hashlib relâche le GIL : les essais se répartissent sur les cœurs (T-25).
+    if not await asyncio.to_thread(verify_password, password, stored) or token is None:
         raise _UNAUTHORIZED
     ensure_live(token)
     return token

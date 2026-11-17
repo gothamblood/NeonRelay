@@ -675,13 +675,23 @@ def _check_keyboard(clavier: str) -> None:
 #
 # Chaque trame fait FRAME_BYTES = 512 octets sur le fil, vraie ou fausse :
 #   nonce AES (12) | AES-256-GCM(K2)( nonce XSalsa (24) | XSalsa20-Poly1305(K1)(clair) | tag (16) ) | tag AES (16)
-# Clair (444 octets) = version(1) | drapeaux(1) | id du message(8) | n°(2) | total(2)
-#                      | longueur(2) | morceau du message (428 max) | remplissage à zéro
+# Clair (444 octets) = version(1) | drapeaux(1) | id(8) | n°(2) | total(2) | longueur(2)
+#                      | nb de destinataires(1) | 8 adresses de session (8 x 8)
+#                      | morceau du message (363 max) | remplissage à zéro
 # Drapeau 0x01 = fausse trame (bruit chiffré). Le marqueur est DANS le chiffré :
 # le serveur et le réseau ne voient que 512 octets aléatoires, comme pour une
 # vraie trame. K1 et K2 sont tirées de la clé E2E (SHA-256 ou Argon2id, voir
 # « PIN optionnel ») par BLAKE2b avec deux étiquettes différentes : deux clés
 # indépendantes pour deux familles de chiffrement (il faudrait casser les deux).
+#
+# Anti-rejeu SANS horloge (un horodatage trahirait le décalage d'horloge de
+# l'expéditeur, donc une empreinte) : chaque client tire au démarrage une
+# « adresse de session » aléatoire de 8 octets et l'annonce dans ses fausses
+# trames (champ id). Un vrai message porte les adresses des correspondants en
+# ligne au moment de l'envoi ; un destinataire n'accepte que les messages qui
+# portent SON adresse du moment (une trame d'une session passée est refusée) et
+# jamais deux fois le même id (rejeu dans la session, mémoire en RAM seulement).
+#
 # Même code pour scripts/secure-shell.sh (scripts/base/_channel.py importe ce
 # fichier) : les deux se parlent.
 # ---------------------------------------------------------------------------
@@ -690,9 +700,12 @@ FRAME_BYTES = 512
 TICK = 0.2
 FRAME_VERSION = 2
 _FRAME_AAD = b"neonrelay-frame-v2"
-_HDR = struct.Struct(">BB8sHHH")
-_PLAIN_BYTES = FRAME_BYTES - 12 - 16 - 24 - 16   # 444
-PAYLOAD_MAX = _PLAIN_BYTES - _HDR.size           # 428
+_HDR = struct.Struct(">BB8sHHHB")
+MAX_RECIPIENTS = 8
+_ADDR = 8
+_RCPT_BYTES = MAX_RECIPIENTS * _ADDR
+_PLAIN_BYTES = FRAME_BYTES - 12 - 16 - 24 - 16             # 444
+PAYLOAD_MAX = _PLAIN_BYTES - _HDR.size - _RCPT_BYTES       # 363
 MAX_MESSAGE_FRAMES = 64
 _FLAG_FAKE = 0x01
 
@@ -727,26 +740,31 @@ class FrameCodec:
         return frame
 
     @staticmethod
-    def _plain(flags: int, msg_id: bytes, seq: int, total: int, chunk: bytes = b"") -> bytes:
-        head = _HDR.pack(FRAME_VERSION, flags, msg_id, seq, total, len(chunk))
-        return head + chunk + bytes(_PLAIN_BYTES - len(head) - len(chunk))
+    def _plain(flags: int, msg_id: bytes, seq: int, total: int, chunk: bytes = b"",
+               recipients: tuple = ()) -> bytes:
+        rcpt = b"".join(recipients[:MAX_RECIPIENTS])
+        head = _HDR.pack(FRAME_VERSION, flags, msg_id, seq, total, len(chunk), len(recipients[:MAX_RECIPIENTS]))
+        body = head + rcpt.ljust(_RCPT_BYTES, b"\0") + chunk
+        return body + bytes(_PLAIN_BYTES - len(body))
 
-    def fake(self) -> bytes:
-        """Fausse trame : chiffrée comme une vraie, marquée « fake » à l'intérieur."""
-        return self._seal(self._plain(_FLAG_FAKE, os.urandom(8), 0, 0))
+    def fake(self, address: bytes) -> bytes:
+        """Fausse trame : chiffrée comme une vraie, marquée « fake » à l'intérieur ;
+        elle annonce l'adresse de session de son expéditeur."""
+        return self._seal(self._plain(_FLAG_FAKE, address, 0, 0))
 
-    def message(self, text: str) -> list:
-        """Découpe un message en trames de taille fixe."""
+    def message(self, text: str, recipients) -> list:
+        """Découpe un message en trames de taille fixe, adressées aux sessions données."""
         data = text.encode("utf-8")
         chunks = [data[i:i + PAYLOAD_MAX] for i in range(0, len(data), PAYLOAD_MAX)] or [b""]
         if len(chunks) > MAX_MESSAGE_FRAMES:
             raise ValueError(f"message trop long ({MAX_MESSAGE_FRAMES * PAYLOAD_MAX} octets max)")
         msg_id = os.urandom(8)
-        return [self._seal(self._plain(0, msg_id, i, len(chunks), c)) for i, c in enumerate(chunks)]
+        rcpt = tuple(recipients)[:MAX_RECIPIENTS]
+        return [self._seal(self._plain(0, msg_id, i, len(chunks), c, rcpt)) for i, c in enumerate(chunks)]
 
     def open(self, frame: bytes):
-        """(fausse, id, n°, total, morceau), ou None : bruit du serveur, autre clé
-        ou PIN, trame altérée. Dans tous ces cas : rejet silencieux."""
+        """(fausse, id, n°, total, morceau, destinataires), ou None : bruit du serveur,
+        autre clé ou PIN, trame altérée. Dans tous ces cas : rejet silencieux."""
         from nacl.exceptions import CryptoError
 
         if len(frame) != FRAME_BYTES:
@@ -758,10 +776,13 @@ class FrameCodec:
             return None
         if len(plain) != _PLAIN_BYTES:
             return None
-        version, flags, msg_id, seq, total, length = _HDR.unpack_from(plain)
-        if version != FRAME_VERSION or length > PAYLOAD_MAX:
+        version, flags, msg_id, seq, total, length, nrcpt = _HDR.unpack_from(plain)
+        if version != FRAME_VERSION or length > PAYLOAD_MAX or nrcpt > MAX_RECIPIENTS:
             return None
-        return bool(flags & _FLAG_FAKE), msg_id, seq, total, plain[_HDR.size:_HDR.size + length]
+        r0 = _HDR.size
+        rcpt = tuple(plain[r0 + i * _ADDR:r0 + (i + 1) * _ADDR] for i in range(nrcpt))
+        c0 = r0 + _RCPT_BYTES
+        return bool(flags & _FLAG_FAKE), msg_id, seq, total, plain[c0:c0 + length], rcpt
 
 
 class Reassembler:
@@ -792,6 +813,47 @@ class Reassembler:
             return None
         del self._parts[msg_id]
         return b"".join(parts[i] for i in range(total)).decode("utf-8", "replace")
+
+
+class Inbox:
+    """Côté réception : adresse de session, correspondants en ligne, anti-rejeu.
+
+    Tout vit en RAM, le temps de la session : rien n'est écrit sur disque."""
+
+    PEER_TTL = 30.0          # un correspondant silencieux depuis 30 s n'est plus adressé
+    MAX_DONE = 100_000       # ids de messages déjà affichés (8 octets chacun)
+
+    def __init__(self) -> None:
+        self.address = os.urandom(_ADDR)
+        self._peers: dict = {}
+        self._done: collections.OrderedDict = collections.OrderedDict()
+        self._reasm = Reassembler()
+        self._lock = threading.Lock()
+
+    def recipients(self) -> tuple:
+        """Adresses des correspondants entendus récemment (les plus récents d'abord)."""
+        now = time.monotonic()
+        with self._lock:
+            live = [(t, a) for a, t in self._peers.items() if now - t <= self.PEER_TTL and a != self.address]
+        return tuple(a for _, a in sorted(live, reverse=True)[:MAX_RECIPIENTS])
+
+    def accept(self, opened):
+        """opened = FrameCodec.open(...) non nul. Renvoie ("fake", None),
+        ("msg", texte), ou None (trame à ignorer : pas pour nous, rejeu, morceau)."""
+        fake, msg_id, seq, total, chunk, rcpt = opened
+        with self._lock:
+            if fake:
+                self._peers[msg_id] = time.monotonic()
+                return "fake", None
+            if self.address not in rcpt or msg_id in self._done:
+                return None          # session passée (rejeu différé) ou déjà affiché (rejeu)
+            text = self._reasm.add(msg_id, seq, total, chunk)
+            if text is None:
+                return None
+            self._done[msg_id] = None
+            while len(self._done) > self.MAX_DONE:
+                self._done.popitem(last=False)
+            return "msg", text
 
 
 # ---------------------------------------------------------------------------
@@ -1025,8 +1087,9 @@ class Outbox:
     """Trames à envoyer. Vide => une fausse trame part à la place : le débit montant
     ne dépend jamais de ce que tu écris."""
 
-    def __init__(self, codec: FrameCodec) -> None:
+    def __init__(self, codec: FrameCodec, address: bytes) -> None:
         self._codec = codec
+        self._address = address
         self._q: collections.deque = collections.deque()
         self._lock = threading.Lock()
 
@@ -1038,7 +1101,7 @@ class Outbox:
         with self._lock:
             if self._q:
                 return self._q.popleft(), True
-        return self._codec.fake(), False
+        return self._codec.fake(self._address), False
 
     def give_back(self, frame: bytes) -> None:
         with self._lock:
@@ -1112,8 +1175,8 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
     print("   Tape un message puis Entrée pour l'envoyer ; Ctrl+C pour quitter.\n")
 
     sid = secrets.token_hex(16)
-    outbox = Outbox(codec)
-    reasm = Reassembler()
+    inbox = Inbox()
+    outbox = Outbox(codec, inbox.address)
     stop = threading.Event()
     ready = threading.Event()
     fatal: list[str] = []
@@ -1124,17 +1187,16 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
         opened = codec.open(frame)
         if opened is None:
             return  # bruit du serveur, autre clé/PIN, ou trame altérée : rejet silencieux
-        fake, msg_id, seq, total, chunk = opened
         with lock:
             state["last_valid"] = time.monotonic()
             if not state["online"]:
                 state["online"] = True
                 _say("🟢 un correspondant est en ligne (même clé, même PIN)")
-        if fake:
-            return  # bruit d'un correspondant : il sert de battement de cœur
-        text = reasm.add(msg_id, seq, total, chunk)
-        if text is not None:
-            _say(f"← {text}")
+        got = inbox.accept(opened)
+        if got and got[0] == "msg":
+            _say(f"← {got[1]}")
+        # "fake" : bruit d'un correspondant (battement de cœur + son adresse de
+        # session) ; None : pas pour cette session, rejeu, ou morceau en attente.
 
     def supervise() -> None:
         # Alerte LOCALE uniquement (rien n'est envoyé) : un silence peut vouloir
@@ -1195,8 +1257,12 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
                 break
             if not text:
                 continue
+            recipients = inbox.recipients()
+            if not recipients:
+                print("⚠️  aucun correspondant en ligne : message non envoyé (rien n'est stocké).")
+                continue
             try:
-                frames = codec.message(text)
+                frames = codec.message(text, recipients)
             except ValueError as exc:
                 print(f"⚠️  non envoyé : {exc}")
                 continue

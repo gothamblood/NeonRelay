@@ -7,6 +7,7 @@ created and its credentials are written once to a plaintext file so you know
 them (meant as a temporary convenience — rotate/remove in production).
 """
 
+import asyncio
 import base64
 import os
 
@@ -17,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import settings
 from .database import SessionLocal, get_session
 from .models import AdminUser
-from .security import generate_password, hash_password, verify_password
+from .security import DUMMY_HASH, generate_password, hash_password, verify_password
 
 ADMIN_CREDS_FILE = settings.ADMIN_CREDS_FILE
 
@@ -82,6 +83,9 @@ async def require_admin(
     username, password = creds
 
     user = await session.get(AdminUser, username)
-    if user is None or not verify_password(password, user.password_hash):
+    # Nom inconnu : on paie quand même un PBKDF2 (contre DUMMY_HASH), sinon le
+    # temps de réponse révèle si le nom d'admin existe (T-24, F3).
+    stored = user.password_hash if user is not None else DUMMY_HASH
+    if not await asyncio.to_thread(verify_password, password, stored) or user is None:
         raise _UNAUTHORIZED
     return username
