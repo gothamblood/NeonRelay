@@ -73,7 +73,7 @@ $Wheels = @(
 
 # Le client lui-même. Empreintes mises à jour par client/epingler.sh.
 $ClientFiles = @(
-  @{ Name = 'neonrelay.py'; Sha256 = '9d52c420bf36895173cc0d2e1d254c2f2a993093196feeec3ae4418ce8db3046' },
+  @{ Name = 'neonrelay.py'; Sha256 = 'a7e2c7095688daae0e3d93c308f0f71ac9e413c188081a5ed423b559dc1154e0' },
   @{ Name = 'openssl-tls.cnf'; Sha256 = '5596a78c6bf8ef189355a832dea9208e157277efceeedf4629d7d74731df88d0' }
 )
 

@@ -442,24 +442,102 @@ def _c_array(name: str, data: list[int]) -> str:
 # Modificateur ALT_CODE (0xFF, Windows) : code Alt — Alt maintenu, chiffres du
 # code décimal sur le pavé numérique (HID 89-97 = 1-9, 98 = 0), Alt relâché.
 # Sans zéro en tête : page OEM, identique à l'ASCII pour 33-126.
+#
+# Frappe rapide (chaque rapport USB attend une interrogation de l'hôte, 10 ms) :
+#   - rapport() attend l'hôte sans les pauses de 5 ms de DigiKeyboard ;
+#   - pas de rapport « touche relâchée » entre deux touches différentes : passer
+#     de « a » à « b » relâche a et enfonce b. On relâche seulement si la même
+#     touche revient (sinon l'hôte n'y voit qu'une touche maintenue) ou si les
+#     modificateurs changent pendant qu'une touche est enfoncée (Maj/Alt posés
+#     ou levés à part). Touche + modificateur dans un même rapport, à partir de
+#     « rien d'enfoncé », comme le faisait déjà DigiKeyboard.sendKeyStroke.
 _TYPE_SEQ = """#define ALT_CODE 0xFF
+static uint8_t heldKey, heldMod;
+
+static void rapport(uint8_t k, uint8_t m) {
+  while (!usbInterruptIsReady()) usbPoll();         // attente active, sans _delay_ms(5)
+  uint8_t r[2] = {m, k};
+  usbSetInterrupt(r, sizeof(r));
+  heldKey = k;
+  heldMod = m;
+}
+
+static void tape(uint8_t k, uint8_t m) {
+  if (heldKey && (k == heldKey || m != heldMod))
+    rapport(0, m);                                  // relâche, et pose les modificateurs à part
+  rapport(k, m);
+}
+
 static void altCode(uint8_t c) {
   uint8_t d[3], n = 0;
   do { d[n++] = c % 10; c /= 10; } while (c);
   while (n) {
     uint8_t k = d[--n];
-    DigiKeyboard.sendKeyPress(k ? 88 + k : 98, MOD_ALT_LEFT);
-    DigiKeyboard.sendKeyPress(0, MOD_ALT_LEFT);
+    tape(k ? 88 + k : 98, MOD_ALT_LEFT);
   }
-  DigiKeyboard.sendKeyPress(0, 0);                  // Alt relâché : Windows produit le caractère
+  rapport(0, 0);                                    // Alt relâché : Windows produit le caractère
 }
 
 static void typeSeq(const uint8_t *seq, uint16_t len, uint8_t pace) {
   for (uint16_t i = 0; i < len; i += 2) {
     uint8_t k = pgm_read_byte(seq + i), m = pgm_read_byte(seq + i + 1);
-    if (m == ALT_CODE) altCode(k); else DigiKeyboard.sendKeyStroke(k, m);
+    if (m == ALT_CODE) altCode(k); else tape(k, m);
     if (pace) DigiKeyboard.delay(pace);
   }
+  rapport(0, 0);                                    // tout relâché
+}
+
+// Voyants (bibliothèque NeonRelayKeyboard : l'hôte envoie leur état, ledState).
+// Avant de taper : Verr. Maj. éteint (sinon les lettres tapées en direct sont
+// inversées), et sous Windows Verr. Num. allumé (codes Alt). Après : état rendu.
+// Si l'hôte n'a rien envoyé, un appui sur Verr. Maj. le provoque ; s'il ne
+// répond toujours pas, on tape à l'aveugle comme avant.
+#define HID_CAPS_LOCK 57
+#define HID_NUM_LOCK  83
+static uint8_t ledsBefore, ledsKnown;
+
+static bool attendVoyants(uint8_t mask, uint8_t want, uint16_t maxMs = 500) {
+  for (uint16_t ms = 0; ms < maxMs; ms += 10) {
+    if (ledSeen && (ledState & mask) == want) return true;
+    DigiKeyboard.delay(10);
+  }
+  return false;
+}
+
+static void bascule(uint8_t k, uint8_t bit) {
+  uint8_t want = (ledState & bit) ^ bit;
+  tape(k, 0);
+  rapport(0, 0);
+  attendVoyants(bit, want);
+}
+
+static void preparerVoyants(bool numLock) {
+  bool provoque = false;
+  // L'hôte envoie l'état des voyants une fois son pilote clavier prêt : c'est
+  // le signal qu'il recevra les touches (1er branchement : installation du
+  // pilote, plusieurs secondes). Puis un temps de stabilisation.
+  if (attendVoyants(0, 0, 8000)) DigiKeyboard.delay(500);
+  else {                                            // rien reçu : on provoque l'envoi
+    tape(HID_CAPS_LOCK, 0);
+    rapport(0, 0);
+    if (!attendVoyants(0, 0)) {                     // hôte muet : on annule l'appui,
+      tape(HID_CAPS_LOCK, 0);                       // puis frappe à l'aveugle
+      rapport(0, 0);
+      return;
+    }
+    provoque = true;
+  }
+  ledsKnown = 1;
+  ledsBefore = ledState ^ (provoque ? LED_CAPS_LOCK : 0);
+  if (ledState & LED_CAPS_LOCK) bascule(HID_CAPS_LOCK, LED_CAPS_LOCK);
+  if (numLock && !(ledState & LED_NUM_LOCK)) bascule(HID_NUM_LOCK, LED_NUM_LOCK);
+  DigiKeyboard.delay(200);                          // avant le raccourci d'ouverture
+}
+
+static void rendreVoyants() {
+  if (!ledsKnown) return;
+  if ((ledState ^ ledsBefore) & LED_CAPS_LOCK) bascule(HID_CAPS_LOCK, LED_CAPS_LOCK);
+  if ((ledState ^ ledsBefore) & LED_NUM_LOCK) bascule(HID_NUM_LOCK, LED_NUM_LOCK);
 }"""
 
 
@@ -478,6 +556,7 @@ def digispark_sketch(key_text: str, clavier: str, python_delay_ms: int,
         enc = lambda text, keep_case=False: _hid_bytes(  # noqa: E731
             text, layout, SYMBOLS.get(clavier), keep_case)
     launch_pace = 0
+    num_lock = "true" if target == "windows" else "false"  # codes Alt : Verr. Num. requis
     boot_decl = boot_steps = ""
     if bootstrap and target == "windows":
         launch = enc("cmd")
@@ -505,7 +584,7 @@ def digispark_sketch(key_text: str, clavier: str, python_delay_ms: int,
 // Séquence : {sequence}.
 // Les tableaux contiennent des paires (code de touche HID, modificateur ;
 // 255 = code Alt du caractère ASCII).
-#include "DigiKeyboard.h"
+#include "NeonRelayKeyboard.h"   // DigiKeyboard + voyants : neonrelay/digispark/NeonRelayKeyboard
 #include <avr/pgmspace.h>
 
 {_c_array("LAUNCH", launch)}
@@ -517,13 +596,16 @@ def digispark_sketch(key_text: str, clavier: str, python_delay_ms: int,
 void setup() {{
   DigiKeyboard.sendKeyStroke(0);
   DigiKeyboard.delay(1500);                         // le système reconnaît le « clavier »
+  preparerVoyants({num_lock});
   {open_stroke}
   DigiKeyboard.delay({open_delay_ms});
   typeSeq(LAUNCH, sizeof(LAUNCH), {launch_pace});
+  DigiKeyboard.delay(300);                          // la fenêtre finit de traiter la frappe
   DigiKeyboard.sendKeyStroke(KEY_ENTER);{boot_steps}
   DigiKeyboard.delay({python_delay_ms});                         // démarrage du client
   typeSeq(KEY, sizeof(KEY), 0);
   DigiKeyboard.sendKeyStroke(KEY_ENTER);
+  rendreVoyants();
 }}
 
 void loop() {{
@@ -532,57 +614,47 @@ void loop() {{
 """
 
 
-def windows_cmd_sample(bootstrap: str) -> str:
-    """Échantillon tapé dans cmd par le test Windows : tous les caractères passés
-    en code Alt (chiffres, symboles, a q z w m y), précédés de « rem »."""
-    risky = sorted({c for c in bootstrap if c != " " and c.lower() not in _WIN_SAFE_LETTERS
-                    and not c.isdigit()})
-    return "rem " + "".join(risky) + " 0123456789 aqzwmy AQZWMY"
+def windows_test_line(bootstrap: str) -> str:
+    """Ligne tapée dans cmd par le test Windows : la commande d'amorçage
+    précédée de « rem », et SANS Entrée (rien n'est exécuté)."""
+    return "rem " + bootstrap
 
 
 def windows_test_sketch(bootstrap: str) -> str:
-    """Firmware SANS clé pour valider la frappe universelle (codes Alt) :
-    1) Win+R → notepad → commande d'amorçage complète (à comparer) ;
-    2) Win+R → cmd → échantillon « rem … » SANS Entrée (rien n'est exécuté)."""
-    sample = windows_cmd_sample(bootstrap)
+    """Firmware SANS clé pour valider la frappe universelle (codes Alt) dans cmd,
+    là même où la vraie clé tape : Win+R → cmd → « rem » + commande d'amorçage
+    complète, SANS Entrée (rien n'est exécuté)."""
+    line = windows_test_line(bootstrap)
     return f"""// NeonRelay — TEST DE FRAPPE WINDOWS (sans clé) généré par : neonrelay.py test-clavier
 // Frappe universelle : codes Alt, quelle que soit la disposition du clavier.
 //
-// 1) Bloc-notes : la commande d'amorçage complète, SANS l'exécuter.
-//    Comparer à NOM-test-clavier-windows.txt (identique au caractère près).
-// 2) cmd : l'échantillon ci-dessous (NOM-test-clavier-windows-cmd.txt), SANS Entrée :
-//    {sample}
+// Win+R → cmd → « rem » + commande d'amorçage complète, SANS Entrée (rien
+// n'est exécuté). Comparer à NOM-test-clavier-windows.txt (identique au
+// caractère près).
 //
-// À jouer : Verr. Num. ALLUMÉ, puis ÉTEINT ; et sous plusieurs dispositions.
-#include "DigiKeyboard.h"
+// À jouer avec Verr. Num. et Verr. Maj. dans tous les états (la clé les règle,
+// puis les rend à la fin) ; et sous plusieurs dispositions.
+#include "NeonRelayKeyboard.h"   // DigiKeyboard + voyants : neonrelay/digispark/NeonRelayKeyboard
 #include <avr/pgmspace.h>
-
-{_c_array("NOTEPAD", _win_bytes("notepad"))}
-
-{_c_array("BOOT", _win_bytes(bootstrap))}
 
 {_c_array("CMD", _win_bytes("cmd"))}
 
-{_c_array("SAMPLE", _win_bytes(sample))}
+{_c_array("LINE", _win_bytes(line))}
 
 {_TYPE_SEQ}
 
 void setup() {{
   DigiKeyboard.sendKeyStroke(0);
   DigiKeyboard.delay(1500);
-  DigiKeyboard.sendKeyStroke(KEY_R, MOD_GUI_LEFT);                  // Win+R
-  DigiKeyboard.delay(800);
-  typeSeq(NOTEPAD, sizeof(NOTEPAD), 0);
-  DigiKeyboard.sendKeyStroke(KEY_ENTER);
-  DigiKeyboard.delay(2500);                         // ouverture du Bloc-notes
-  typeSeq(BOOT, sizeof(BOOT), 4);
-  DigiKeyboard.delay(1000);
+  preparerVoyants(true);
   DigiKeyboard.sendKeyStroke(KEY_R, MOD_GUI_LEFT);                  // Win+R
   DigiKeyboard.delay(800);
   typeSeq(CMD, sizeof(CMD), 0);
+  DigiKeyboard.delay(300);                          // Win+R finit de traiter la frappe
   DigiKeyboard.sendKeyStroke(KEY_ENTER);
   DigiKeyboard.delay(2000);                         // ouverture de cmd
-  typeSeq(SAMPLE, sizeof(SAMPLE), 4);               // PAS d'Entrée
+  typeSeq(LINE, sizeof(LINE), 4);                   // PAS d'Entrée
+  rendreVoyants();
 }}
 
 void loop() {{
@@ -594,12 +666,13 @@ void loop() {{
 def keyboard_test_sketch(bootstrap: str, clavier: str, target: str = "windows") -> str:
     """Firmware SANS clé : tape la commande d'amorçage SANS l'exécuter, pour
     vérifier la table de symboles du clavier avant de flasher la vraie clé.
-      windows : Win+R → notepad → texte dans le Bloc-notes ;
+      windows : Win+R → cmd → « rem » + texte, sans Entrée ;
       linux   : Ctrl+Alt+T → « tee nrtestclavier » → texte → Ctrl+D
                 (enregistré dans ~/nrtestclavier, jamais exécuté)."""
     if target == "windows":
         return windows_test_sketch(bootstrap)
     label, layout = KEYBOARDS[clavier]
+    num_lock = "true" if target == "windows" else "false"
     boot = _hid_bytes(bootstrap, layout, SYMBOLS[clavier], keep_case=True)
     if target == "linux":
         launch, where = "tee nrtestclavier", "~/nrtestclavier (via tee)"
@@ -622,7 +695,7 @@ def keyboard_test_sketch(bootstrap: str, clavier: str, target: str = "windows") 
 // Vérifier : {check}.
 // Le texte doit être identique au caractère près ; sinon corriger
 // SYMBOLS["{clavier}"] dans neonrelay.py.
-#include "DigiKeyboard.h"
+#include "NeonRelayKeyboard.h"   // DigiKeyboard + voyants : neonrelay/digispark/NeonRelayKeyboard
 #include <avr/pgmspace.h>
 
 {_c_array("LAUNCH", _hid_bytes(launch, layout))}
@@ -634,12 +707,14 @@ def keyboard_test_sketch(bootstrap: str, clavier: str, target: str = "windows") 
 void setup() {{
   DigiKeyboard.sendKeyStroke(0);
   DigiKeyboard.delay(1500);
+  preparerVoyants({num_lock});
   {open_stroke}
   DigiKeyboard.delay({open_ms});
   typeSeq(LAUNCH, sizeof(LAUNCH), 0);
   DigiKeyboard.sendKeyStroke(KEY_ENTER);
   DigiKeyboard.delay({ready_ms});
   typeSeq(BOOT, sizeof(BOOT), 4);{finish}
+  rendreVoyants();
 }}
 
 void loop() {{
@@ -655,11 +730,9 @@ def write_keyboard_tests(base: str, boots: dict, clavier: str) -> None:
     for target, (bootstrap, _) in boots.items():
         with open(f"{base}-test-clavier-{target}.ino", "w", encoding="utf-8") as fh:
             fh.write(keyboard_test_sketch(bootstrap, clavier, target))
+        expected = windows_test_line(bootstrap) if target == "windows" else bootstrap
         with open(f"{base}-test-clavier-{target}.txt", "w", encoding="ascii") as fh:
-            fh.write(bootstrap + "\n")
-        if target == "windows":  # échantillon attendu dans cmd (sans Entrée)
-            with open(f"{base}-test-clavier-windows-cmd.txt", "w", encoding="ascii") as fh:
-                fh.write(windows_cmd_sample(bootstrap) + "\n")
+            fh.write(expected + "\n")
         print(f"Test      : {base}-test-clavier-{target}.ino (sans clé) ; "
               f"texte attendu : {base}-test-clavier-{target}.txt", file=sys.stderr)
 
