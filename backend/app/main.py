@@ -8,6 +8,7 @@ and no route-ordering hazard:
   * /channel/{token}    -- noisy channel: constant-size, constant-rate frames
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -26,7 +27,11 @@ async def lifespan(app: FastAPI):
     await init_db()
     await ensure_admin()  # create default admin + write credentials on first boot
     log_action("startup")
-    yield
+    sweeper = asyncio.create_task(tokens.sweep_loop())  # boîtes échues : détruites
+    try:
+        yield
+    finally:
+        sweeper.cancel()
 
 
 app = FastAPI(

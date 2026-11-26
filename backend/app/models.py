@@ -55,10 +55,26 @@ class Token(Base):
         DateTime(timezone=True), nullable=True, default=None
     )
 
+    # $/deadman : homme mort. La boîte est détruite si personne ne remet le
+    # compteur à zéro (avec le mot de passe de l'homme mort, distinct de celui de
+    # la boîte, haché PBKDF2) avant l'échéance. NULL = pas d'homme mort.
+    deadman_hash: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    deadman_deadline: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
+    @staticmethod
+    def _aware(dt: datetime | None) -> datetime | None:
+        if dt is not None and dt.tzinfo is None:  # SQLite may hand back a naive datetime
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def deadline(self) -> datetime | None:
+        """Échéance effective : la plus proche de expires_at ($/selfdestruct, TTL)
+        et de l'homme mort. None = jamais."""
+        dates = [d for d in (self._aware(self.expires_at), self._aware(self.deadman_deadline)) if d]
+        return min(dates) if dates else None
+
     def is_expired(self) -> bool:
-        if self.expires_at is None:
-            return False
-        exp = self.expires_at
-        if exp.tzinfo is None:  # SQLite may hand back a naive datetime
-            exp = exp.replace(tzinfo=timezone.utc)
-        return _now() >= exp
+        d = self.deadline()
+        return d is not None and _now() >= d

@@ -5,10 +5,16 @@ requête de la taille du message, au moment où il est envoyé. Le canal bruité
 supprime ces deux signaux.
 
   * POST /channel/{token}  (montant) : UNE requête longue en Transfer-Encoding
-    chunked. Le client y écrit une trame de FRAME_BYTES octets à chaque tic,
-    qu'il ait quelque chose à dire ou non (vraie trame, ou fausse trame chiffrée
-    marquée « fake » À L'INTÉRIEUR du chiffré). Le serveur relaie chaque trame
-    telle quelle aux autres auditeurs de la boîte, sans la comprendre.
+    chunked. Le client y écrit à chaque tic 1 octet de contrôle + une trame de
+    FRAME_BYTES octets, qu'il ait quelque chose à dire ou non (vraie trame, ou
+    fausse trame chiffrée marquée « fake » À L'INTÉRIEUR du chiffré). Taille
+    constante : le réseau ne distingue pas les octets de contrôle.
+      0 : relayer la trame telle quelle aux autres auditeurs de la boîte ;
+      1 : $/stashserver, 1re trame : la garder pour la prochaine session (écrase
+          le message gardé) ; 3 : trame suivante du même message ;
+      2 : $/stashserver cancel : oublier le message gardé (la trame, un bruit
+          chiffré, est relayée normalement).
+    Le serveur ne comprend aucune trame : il sait seulement qu'un message attend.
   * GET /channel/{token}   (descendant) : UNE réponse longue. À chaque tic, le
     serveur écrit exactement SLOTS trames : celles en attente pour cet auditeur,
     complétées par des octets aléatoires. Aléatoire et chiffré sont
@@ -23,7 +29,8 @@ lui sont pas renvoyées (sinon la voie descendante devrait porter deux fois plus
 de créneaux). Cet identifiant ne vit qu'en mémoire et ne désigne rien d'autre
 qu'une session.
 
-Rien n'est stocké ni journalisé, à part une ligne d'action sans contenu.
+Rien n'est stocké ni journalisé, à part une ligne d'action sans contenu (et, en
+mémoire seulement, au plus un message $/stashserver chiffré par boîte).
 """
 
 import asyncio
@@ -38,7 +45,7 @@ from starlette.requests import ClientDisconnect
 from ..auth import resolve_token
 from ..config import settings
 from ..database import SessionLocal
-from ..events import revocations
+from ..events import channel_stash, revocations
 from ..logging_setup import log_action
 from ..ratelimit import RateLimiter
 
@@ -46,6 +53,8 @@ router = APIRouter(prefix="/channel", tags=["channel"])
 
 _SESSION_HEADER = "x-neonrelay-session"
 _SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
+
+CTL_RELAY, CTL_STASH, CTL_CANCEL, CTL_STASH_MORE = 0, 1, 2, 3
 
 # Débit montant toléré par boîte (toutes sessions confondues). Un client honnête
 # envoie 1/TICK trames par seconde ; au-delà, la connexion est coupée.
@@ -137,6 +146,8 @@ async def channel_down(token_id: str, request: Request):
         log_action("channel.down.refused", token=token.id, reason="cap")
         raise _refuse(status.HTTP_429_TOO_MANY_REQUESTS, "Too many listeners for this box.")
     queue = channel_broker.subscribe(token.id, sid)
+    for held in channel_stash.pop_for(token.id, sid):  # $/stashserver : livré d'abord
+        queue.put_nowait(held)
     frame, slots, tick = settings.CHANNEL_FRAME_BYTES, settings.CHANNEL_SLOTS, settings.CHANNEL_TICK
     log_action("channel.down.start", token=token.id)
 
@@ -184,6 +195,7 @@ async def channel_up(token_id: str, request: Request):
         raise _refuse(status.HTTP_429_TOO_MANY_REQUESTS, "Too many senders for this box.")
     senders.add(sid)
     size = settings.CHANNEL_FRAME_BYTES
+    unit = 1 + size                       # octet de contrôle + trame
     buf = bytearray()
     log_action("channel.up.start", token=token.id)
     reason = "closed"
@@ -193,14 +205,28 @@ async def channel_up(token_id: str, request: Request):
                 reason = "revoked"
                 return Response(status_code=status.HTTP_410_GONE, headers={"Connection": "close"})
             buf += chunk
-            while len(buf) >= size:
-                frame = bytes(buf[:size])
-                del buf[:size]
+            while len(buf) >= unit:
+                ctl, frame = buf[0], bytes(buf[1:unit])
+                del buf[:unit]
                 if frame_limiter.check(token.id):
                     reason = "throttled"
                     return Response(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                                     headers={"Connection": "close"})
-                channel_broker.publish(token.id, frame, sid)
+                if ctl == CTL_STASH:
+                    channel_stash.start(token.id, sid, frame)
+                    log_action("channel.stash", token=token.id)
+                elif ctl == CTL_STASH_MORE:
+                    channel_stash.extend(token.id, sid, frame, settings.CHANNEL_STASH_FRAMES)
+                elif ctl == CTL_CANCEL:
+                    channel_stash.clear(token.id)
+                    log_action("channel.stash.cancel", token=token.id)
+                    channel_broker.publish(token.id, frame, sid)
+                elif ctl == CTL_RELAY:
+                    channel_broker.publish(token.id, frame, sid)
+                else:
+                    reason = "bad-control"
+                    return Response(status_code=status.HTTP_400_BAD_REQUEST,
+                                    headers={"Connection": "close"})
     except ClientDisconnect:
         pass
     finally:

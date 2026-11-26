@@ -751,6 +751,11 @@ def _check_keyboard(clavier: str) -> None:
 # Clair (444 octets) = version(1) | drapeaux(1) | id(8) | n°(2) | total(2) | longueur(2)
 #                      | nb de destinataires(1) | 8 adresses de session (8 x 8)
 #                      | morceau du message (363 max) | remplissage à zéro
+# Drapeau 0x02 = message de boîte ($/stashserver) : gardé par le serveur pour la
+# prochaine session, sans adresse de destinataire (accepté par toute session,
+# jamais deux fois le même id dans une session).
+# Sur le fil, chaque trame montante est précédée d'1 octet de contrôle lu par le
+# serveur (0 relayer, 1/3 garder, 2 oublier le message gardé) : taille constante.
 # Drapeau 0x01 = fausse trame (bruit chiffré). Le marqueur est DANS le chiffré :
 # le serveur et le réseau ne voient que 512 octets aléatoires, comme pour une
 # vraie trame. K1 et K2 sont tirées de la clé E2E (SHA-256 ou Argon2id, voir
@@ -781,6 +786,9 @@ _PLAIN_BYTES = FRAME_BYTES - 12 - 16 - 24 - 16             # 444
 PAYLOAD_MAX = _PLAIN_BYTES - _HDR.size - _RCPT_BYTES       # 363
 MAX_MESSAGE_FRAMES = 64
 _FLAG_FAKE = 0x01
+_FLAG_BOX = 0x02
+CTL_RELAY, CTL_STASH, CTL_CANCEL, CTL_STASH_MORE = 0, 1, 2, 3
+STASH_SERVER_FRAMES = 8          # = CHANNEL_STASH_FRAMES du serveur
 
 
 class FrameCodec:
@@ -804,6 +812,12 @@ class FrameCodec:
         self._aes_enc = bindings.crypto_aead_aes256gcm_encrypt
         self._aes_dec = bindings.crypto_aead_aes256gcm_decrypt
 
+    def forget(self) -> None:
+        """$/abort, $/zeroize : lâche les clés. Python ne garantit pas l'effacement de la
+        mémoire (objets immuables) : le processus se termine juste après."""
+        self._k2 = b""
+        self._box = None
+
     def _seal(self, plain: bytes) -> bytes:
         inner = bytes(self._box.encrypt(plain))
         nonce = os.urandom(12)
@@ -825,18 +839,20 @@ class FrameCodec:
         elle annonce l'adresse de session de son expéditeur."""
         return self._seal(self._plain(_FLAG_FAKE, address, 0, 0))
 
-    def message(self, text: str, recipients) -> list:
-        """Découpe un message en trames de taille fixe, adressées aux sessions données."""
+    def message(self, text: str, recipients, box: bool = False) -> list:
+        """Découpe un message en trames de taille fixe, adressées aux sessions
+        données ; box=True : message de boîte ($/stashserver), sans adresse."""
         data = text.encode("utf-8")
         chunks = [data[i:i + PAYLOAD_MAX] for i in range(0, len(data), PAYLOAD_MAX)] or [b""]
         if len(chunks) > MAX_MESSAGE_FRAMES:
             raise ValueError(f"message trop long ({MAX_MESSAGE_FRAMES * PAYLOAD_MAX} octets max)")
         msg_id = os.urandom(8)
-        rcpt = tuple(recipients)[:MAX_RECIPIENTS]
-        return [self._seal(self._plain(0, msg_id, i, len(chunks), c, rcpt)) for i, c in enumerate(chunks)]
+        rcpt = () if box else tuple(recipients)[:MAX_RECIPIENTS]
+        flags = _FLAG_BOX if box else 0
+        return [self._seal(self._plain(flags, msg_id, i, len(chunks), c, rcpt)) for i, c in enumerate(chunks)]
 
     def open(self, frame: bytes):
-        """(fausse, id, n°, total, morceau, destinataires), ou None : bruit du serveur,
+        """(fausse, id, n°, total, morceau, destinataires, boîte), ou None : bruit du serveur,
         autre clé ou PIN, trame altérée. Dans tous ces cas : rejet silencieux."""
         from nacl.exceptions import CryptoError
 
@@ -855,7 +871,8 @@ class FrameCodec:
         r0 = _HDR.size
         rcpt = tuple(plain[r0 + i * _ADDR:r0 + (i + 1) * _ADDR] for i in range(nrcpt))
         c0 = r0 + _RCPT_BYTES
-        return bool(flags & _FLAG_FAKE), msg_id, seq, total, plain[c0:c0 + length], rcpt
+        return (bool(flags & _FLAG_FAKE), msg_id, seq, total, plain[c0:c0 + length], rcpt,
+                bool(flags & _FLAG_BOX))
 
 
 class Reassembler:
@@ -912,13 +929,14 @@ class Inbox:
 
     def accept(self, opened):
         """opened = FrameCodec.open(...) non nul. Renvoie ("fake", None),
-        ("msg", texte), ou None (trame à ignorer : pas pour nous, rejeu, morceau)."""
-        fake, msg_id, seq, total, chunk, rcpt = opened
+        ("msg", texte), ("box", texte) (message laissé sur le serveur), ou None
+        (trame à ignorer : pas pour nous, rejeu, morceau)."""
+        fake, msg_id, seq, total, chunk, rcpt, box = opened
         with self._lock:
             if fake:
                 self._peers[msg_id] = time.monotonic()
                 return "fake", None
-            if self.address not in rcpt or msg_id in self._done:
+            if (not box and self.address not in rcpt) or msg_id in self._done:
                 return None          # session passée (rejeu différé) ou déjà affiché (rejeu)
             text = self._reasm.add(msg_id, seq, total, chunk)
             if text is None:
@@ -926,7 +944,7 @@ class Inbox:
             self._done[msg_id] = None
             while len(self._done) > self.MAX_DONE:
                 self._done.popitem(last=False)
-            return "msg", text
+            return ("box" if box else "msg"), text
 
 
 # ---------------------------------------------------------------------------
@@ -1166,23 +1184,40 @@ class Outbox:
         self._q: collections.deque = collections.deque()
         self._lock = threading.Lock()
 
-    def put(self, frames: list) -> None:
+    def put(self, frames: list, ctl: int = CTL_RELAY) -> None:
+        """ctl=CTL_STASH : message laissé sur le serveur (1re trame CTL_STASH,
+        suivantes CTL_STASH_MORE)."""
+        if ctl == CTL_STASH:
+            items = [(CTL_STASH if i == 0 else CTL_STASH_MORE, f) for i, f in enumerate(frames)]
+        else:
+            items = [(ctl, f) for f in frames]
         with self._lock:
-            self._q.extend(frames)
+            self._q.extend(items)
+
+    def cancel_stash(self) -> None:
+        """$/stashserver cancel : une fausse trame, marquée « oublier »."""
+        with self._lock:
+            self._q.append((CTL_CANCEL, self._codec.fake(self._address)))
 
     def take(self) -> tuple:
+        """(octet de contrôle, trame, vraie ?)."""
         with self._lock:
             if self._q:
-                return self._q.popleft(), True
-        return self._codec.fake(self._address), False
+                ctl, frame = self._q.popleft()
+                return ctl, frame, True
+        return CTL_RELAY, self._codec.fake(self._address), False
 
-    def give_back(self, frame: bytes) -> None:
+    def give_back(self, ctl: int, frame: bytes) -> None:
         with self._lock:
-            self._q.appendleft(frame)
+            self._q.appendleft((ctl, frame))
 
     def pending(self) -> int:
         with self._lock:
             return len(self._q)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._q.clear()
 
 
 def _channel_up(key: Key, sid: str, outbox: Outbox, stop: threading.Event) -> None:
@@ -1195,15 +1230,15 @@ def _channel_up(key: Key, sid: str, outbox: Outbox, stop: threading.Event) -> No
         conn.putheader("Content-Type", "application/octet-stream")
         conn.putheader("Transfer-Encoding", "chunked")
         conn.endheaders()
-        head = b"%X\r\n" % FRAME_BYTES
+        head = b"%X\r\n" % (1 + FRAME_BYTES)   # octet de contrôle + trame
         next_tick = time.monotonic()
         while not stop.is_set():
-            frame, real = outbox.take()
+            ctl, frame, real = outbox.take()
             try:
-                conn.send(head + frame + b"\r\n")
+                conn.send(head + bytes((ctl,)) + frame + b"\r\n")
             except Exception:
                 if real:
-                    outbox.give_back(frame)  # renvoyée après reconnexion
+                    outbox.give_back(ctl, frame)  # renvoyée après reconnexion
                 raise
             next_tick += TICK
             delay = next_tick - time.monotonic()
@@ -1230,6 +1265,154 @@ def _say(text: str) -> None:
     sys.stdout.flush()
 
 
+# ---------------------------------------------------------------------------
+# Commandes de la console : une ligne qui commence par « $/ ». « $$/… » envoie
+# « $/… » tel quel. Messages en français puis en anglais.
+# ---------------------------------------------------------------------------
+
+CMD_PREFIX = "$/"
+STASH_MAX = 10
+_FP_ALPHABET = PIN_ALPHABET  # base32 Crockford, comme le PIN
+
+OPTIONS_TEXT = """\
+   $/stash <message>        garde le message ICI (RAM) ; envoyé dès qu'un correspondant arrive
+                            keep the message HERE (RAM); sent as soon as someone comes online
+   $/stash                  messages en attente ici / messages waiting here
+   $/stash clear            les effacer / delete them
+   $/stashserver <message>  laisser sur le serveur pour le prochain qui se connecte (1 seul, chiffré)
+                            leave on the server for the next one to connect (one, encrypted)
+   $/stashserver cancel     le retirer / remove it
+   $/selfdestruct <durée>   détruire la boîte dans 30m, 2h, 3d… (heure du serveur ; seulement avancer)
+                            destroy the box in 30m, 2h, 3d… (server time; can only be brought forward)
+   $/selfdestruct           temps restant / time left
+   $/deadman <durée> <mdp>  homme mort : détruite si le compteur n'est pas remis à zéro à temps ;
+                            la même commande remet à zéro / dead man: destroyed unless reset in time;
+                            the same command resets it
+   $/deadman -c <mdp>       annuler l'homme mort / cancel the dead man
+   $/online                 correspondants en ligne / peers online
+   $/clear                  vider l'écran et l'historique / clear screen and scrollback
+   $/fingerprint            empreinte de la clé, à comparer à voix haute / key fingerprint, compare aloud
+   $/abort                  tout effacer ici et fermer (Entrée pour confirmer) ; la boîte reste
+                            wipe everything here and close (Enter to confirm); the box stays
+   $/abort!                 idem, sans confirmation / same, no confirmation
+   $/zeroize                abort + SUPPRIME LA BOÎTE pour tous, définitif (taper ZEROIZE)
+                            abort + DELETES THE BOX for everyone, permanent (type ZEROIZE)
+   $/zeroize!               idem, sans confirmation / same, no confirmation
+   $/exit                   fermer le canal et la console / close the channel and the console
+   $/options                ce menu / this menu
+   $$/…                     envoyer un message qui commence par « $/ » / send a message starting with « $/ »"""
+
+
+def delete_box(key: Key, timeout: float = 8) -> str:
+    """$/zeroize : supprime la boîte (DELETE /config/{id}, mot de passe de la
+    boîte). Le serveur coupe aussitôt les flux ouverts. "" si supprimée, sinon
+    la raison."""
+    try:
+        conn = connect(key, timeout=timeout)
+        try:
+            conn.request("DELETE", f"/config/{key.token}", headers={_PW_HEADER: key.password})
+            status = conn.getresponse().status
+        finally:
+            conn.close()
+    except (OSError, http.client.HTTPException, CertError) as exc:
+        return f"serveur injoignable / server unreachable ({exc})"
+    if status in (204, 404, 410):   # 404 / 410 : déjà supprimée ou expirée
+        return ""
+    return _http_error(status)
+
+
+_DUR_RE = re.compile(r"(\d+)\s*([dhm])", re.IGNORECASE)
+_DUR_UNITS = {"d": 86400, "h": 3600, "m": 60}
+
+
+def parse_duration(text: str) -> int | None:
+    """« 30m », « 2h », « 3d », « 1d12h » → secondes ; None si illisible."""
+    text = text.strip().lower().replace(" ", "")
+    if not text or _DUR_RE.sub("", text):
+        return None
+    return sum(int(n) * _DUR_UNITS[u] for n, u in _DUR_RE.findall(text)) or None
+
+
+def format_duration(seconds: int) -> str:
+    d, rest = divmod(max(0, int(seconds)), 86400)
+    h, rest = divmod(rest, 3600)
+    m = rest // 60
+    parts = ([f"{d} j/d"] if d else []) + ([f"{h} h"] if h or d else []) + [f"{m:02d} min"]
+    return " ".join(parts)
+
+
+def box_api(key: Key, method: str, path: str, body: dict | None = None,
+            timeout: float = 10) -> tuple[int, dict]:
+    """Requête JSON vers /config/{boîte}{path}, avec le mot de passe de la boîte."""
+    headers = {_PW_HEADER: key.password}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    conn = connect(key, timeout=timeout)
+    try:
+        conn.request(method, f"/config/{key.token}{path}", body=data, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+    finally:
+        conn.close()
+    try:
+        return resp.status, json.loads(raw or b"{}")
+    except ValueError:
+        return resp.status, {}
+
+
+def lifecycle_text(st: dict) -> str:
+    lines = []
+    if st.get("destroy_in") is not None:
+        lines.append(f"   💣 destruction dans / destroyed in {format_duration(st['destroy_in'])}")
+    if st.get("deadman_armed"):
+        lines.append(f"   🕯️  homme mort : destruction sans remise à zéro dans / dead man: destroyed "
+                     f"unless reset in {format_duration(st['deadman_in'] or 0)}")
+    return "\n".join(lines) or "   Aucune échéance / No deadline."
+
+
+def fingerprint(e2e: bytes) -> str:
+    """Empreinte de la clé E2E (PIN compris) : 80 bits, 16 caractères base32.
+    À sens unique : elle ne révèle rien de la clé (les trames chiffrées
+    permettent déjà de tester une clé devinée)."""
+    n = int.from_bytes(hashlib.blake2b(e2e, digest_size=10, person=b"nr-fingerprint").digest(), "big")
+    chars = "".join(_FP_ALPHABET[(n >> (5 * i)) & 31] for i in range(15, -1, -1))
+    return "-".join(chars[i:i + 4] for i in range(0, 16, 4))
+
+
+def clear_screen() -> None:
+    """Vide l'écran ET l'historique de défilement du terminal."""
+    if os.name == "nt":
+        os.system("cls")
+    sys.stdout.write("\033[H\033[2J\033[3J")
+    sys.stdout.flush()
+    try:
+        import readline  # historique des lignes tapées (Linux), en RAM
+        readline.clear_history()
+    except Exception:
+        pass
+
+
+def _close_console_window() -> None:
+    """Ferme la console : Windows, la fenêtre (cmd lancé par le Digispark
+    compris) ; Linux, le shell du terminal (meneur de session : la fenêtre ou
+    l'onglet ouvert par Ctrl+Alt+T se ferme)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        elif sys.stdin.isatty():
+            import signal
+            leader = os.getsid(0)
+            if leader not in (0, 1, os.getpid()):
+                os.kill(leader, signal.SIGHUP)
+    except Exception:
+        pass
+
+
 def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
     """Ouvre le canal bruité. e2e : clé déjà dérivée (scripts bash, PIN compris) ;
     sinon elle est dérivée ici de la passphrase et du PIN."""
@@ -1245,7 +1428,8 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
           f"{TICK:g} s dans chaque sens, que tu parles ou non.").replace("0.", "0,"))
     if not with_pin:
         print("   Sans PIN, tu ne lis pas les correspondants qui ont un PIN (et inversement).")
-    print("   Tape un message puis Entrée pour l'envoyer ; Ctrl+C pour quitter.\n")
+    print("   Tape un message puis Entrée pour l'envoyer ; Ctrl+C pour quitter.")
+    print("   Commandes / Commands : $/options\n")
 
     sid = secrets.token_hex(16)
     inbox = Inbox()
@@ -1268,6 +1452,8 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
         got = inbox.accept(opened)
         if got and got[0] == "msg":
             _say(f"← {got[1]}")
+        elif got and got[0] == "box":
+            _say(f"📦 ← {got[1]}   (laissé sur le serveur / left on the server)")
         # "fake" : bruit d'un correspondant (battement de cœur + son adresse de
         # session) ; None : pas pour cette session, rejeu, ou morceau en attente.
 
@@ -1293,7 +1479,10 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
             try:
                 target()
             except (CertError, RuntimeError) as exc:  # cert inattendu, 401 / 410 : inutile d'insister
+                first = not fatal
                 fatal.append(str(exc))
+                if first and ready.is_set():  # en pleine session (boîte supprimée…) : le dire tout de suite
+                    _say(f"❌ {exc} — Entrée pour fermer / Enter to close")
                 ready.set()
                 stop.set()
                 return
@@ -1323,6 +1512,237 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
     up.start()
     threading.Thread(target=supervise, daemon=True, name="supervise").start()
 
+    stash: collections.deque = collections.deque()   # $/stash : RAM seulement
+    stash_lock = threading.Lock()
+    key_fp = fingerprint(e2e)
+
+    def send(text: str, recipients: tuple) -> bool:
+        try:
+            frames = codec.message(text, recipients)
+        except ValueError as exc:
+            print(f"⚠️  non envoyé / not sent : {exc}")
+            return False
+        outbox.put(frames)
+        if len(frames) > 1:
+            print(f"   (envoi en {len(frames)} trames, environ {len(frames) * TICK:.1f} s)")
+        return True
+
+    def flush_stash() -> None:
+        # Messages mis de côté : partent dès qu'un correspondant est en ligne,
+        # comme des messages ordinaires (mêmes trames, même rythme).
+        while not stop.wait(1):
+            recipients = inbox.recipients()
+            if not recipients:
+                continue
+            with stash_lock:
+                todo = list(stash)
+                stash.clear()
+            for text in todo:
+                outbox.put(codec.message(text, recipients))
+            if todo:
+                _say(f"📤 {len(todo)} message(s) mis de côté envoyé(s) / stashed message(s) sent")
+
+    threading.Thread(target=flush_stash, daemon=True, name="stash").start()
+
+    def wipe_local() -> None:
+        stop.set()
+        with stash_lock:
+            stash.clear()
+        outbox.clear()
+        codec.forget()
+        clear_screen()
+
+    def abort(confirm: bool) -> None:
+        if confirm:
+            print("⚠️  ABORT : efface l'écran et l'historique, abandonne les messages en attente,\n"
+                  "    oublie les clés, ferme le client et la console. La boîte reste intacte.\n"
+                  "    ABORT: wipes screen and scrollback, drops pending messages, forgets keys,\n"
+                  "    closes the client and the console. The box stays intact.")
+            if input("    Entrée pour confirmer, autre chose pour annuler / "
+                     "Enter to confirm, anything else to cancel : ") != "":
+                print("   Annulé / Cancelled.")
+                return
+        wipe_local()
+        _close_console_window()
+        os._exit(0)   # sans attendre les fils ni afficher quoi que ce soit
+
+    def zeroize(confirm: bool) -> None:
+        if confirm:
+            print("☢️  ZEROIZE : ABORT + SUPPRESSION DE LA BOÎTE sur le serveur. Tous les\n"
+                  "    correspondants sont coupés, le message laissé sur le serveur est détruit,\n"
+                  "    et cette clé (comme les leurs) ne servira plus jamais. DÉFINITIF.\n"
+                  "    ZEROIZE: ABORT + DELETES THE BOX on the server. Every peer is cut off, the\n"
+                  "    message left on the server is destroyed, and this key (and theirs) will\n"
+                  "    never work again. PERMANENT.")
+            if input("    Tape ZEROIZE pour confirmer / Type ZEROIZE to confirm : ") != "ZEROIZE":
+                print("   Annulé / Cancelled.")
+                return
+        wipe_local()
+        error = delete_box(key)
+        if error:
+            # La boîte n'est PAS supprimée : on le dit, et la console reste
+            # ouverte pour qu'on le voie (clés déjà oubliées, client fermé).
+            print(f"❌ boîte NON supprimée / box NOT deleted : {error}\n"
+                  "   Préviens l'opérateur NeonRelay / Tell the NeonRelay operator.")
+            sys.stdout.flush()
+            os._exit(1)
+        _close_console_window()
+        os._exit(0)
+
+    def lifecycle(call) -> dict | None:
+        try:
+            status, st = call()
+        except (OSError, http.client.HTTPException, CertError) as exc:
+            print(f"❌ serveur injoignable / server unreachable : {exc}")
+            return None
+        if status == 403:
+            print("❌ mot de passe de l'homme mort refusé / dead-man password refused.")
+            return None
+        if status == 429:
+            print("❌ trop d'essais, réessaie plus tard / too many attempts, try again later.")
+            return None
+        if status == 422:
+            print("❌ refusé : durée de 1 min à 1 an, mot de passe de 8 caractères au moins /\n"
+                  "   refused: duration 1 min to 1 year, password 8 characters at least.")
+            return None
+        if status != 200:
+            print(f"❌ {_http_error(status)}")
+            return None
+        result = st.get("result")
+        if result == "set":
+            print("   💣 compte à rebours lancé (heure du serveur) / countdown started (server time).")
+        elif result == "unchanged":
+            print("   Inchangé : l'échéance actuelle est déjà plus proche (on ne peut qu'avancer) /\n"
+                  "   Unchanged: the current deadline is already sooner (it can only be brought forward).")
+        if result == "armed":
+            print("   🕯️  homme mort ARMÉ / dead man ARMED.")
+        elif result == "reset":
+            print("   ✅ compteur remis à zéro / counter reset to zero.")
+        elif result == "cancelled":
+            print("   🗑️  homme mort annulé / dead man cancelled.")
+        elif result == "not-armed":
+            print("   Aucun homme mort armé / No dead man armed.")
+        print(lifecycle_text(st))
+        return st
+
+    def hide_typed_line() -> None:
+        # La ligne tapée contenait un mot de passe : on l'efface de l'écran et de
+        # l'historique des lignes (readline).
+        sys.stdout.write("\033[1A\033[2K\r→ $/deadman …\n")
+        sys.stdout.flush()
+        try:
+            import readline
+            n = readline.get_current_history_length()
+            if n:
+                readline.remove_history_item(n - 1)
+        except Exception:
+            pass
+
+    def deadman(arg: str) -> None:
+        if not arg:
+            lifecycle(lambda: box_api(key, "GET", "/lifecycle"))
+            return
+        first, _, password = arg.partition(" ")
+        password = password.strip()
+        if password:
+            hide_typed_line()
+        else:
+            password = getpass.getpass("   Mot de passe de l'homme mort / Dead-man password : ")
+        if first.lower() == "-c":
+            lifecycle(lambda: box_api(key, "POST", "/deadman/cancel", {"password": password}))
+            return
+        secs = parse_duration(first)
+        if secs is None or secs < 60:
+            print("   Usage : $/deadman <durée / duration> <mot de passe / password>  ·  "
+                  "$/deadman -c <mot de passe / password>")
+            return
+        lifecycle(lambda: box_api(key, "POST", "/deadman", {"seconds": secs, "password": password}))
+
+    exit_warned = [False]
+
+    def command(line: str) -> bool:
+        """True : $/exit, fermer le canal et la console."""
+        name, _, arg = line[len(CMD_PREFIX):].strip().partition(" ")
+        name, arg = name.lower(), arg.strip()
+        if name == "exit":
+            with stash_lock:
+                waiting = len(stash)
+            if waiting and not exit_warned[0]:
+                exit_warned[0] = True
+                print(f"⚠️  {waiting} message(s) en attente ici seront perdus : retape $/exit pour confirmer.\n"
+                      f"    {waiting} message(s) waiting here will be lost: type $/exit again to confirm.")
+                return False
+            return True
+        exit_warned[0] = False
+        if name == "stash":
+            with stash_lock:
+                if arg.lower() == "clear":
+                    n = len(stash)
+                    stash.clear()
+                    print(f"   {n} message(s) effacé(s) / deleted.")
+                elif not arg:
+                    if not stash:
+                        print("   Aucun message en attente ici / No message waiting here.")
+                    for i, text in enumerate(stash, 1):
+                        print(f"   {i}. {text[:60]}{'…' if len(text) > 60 else ''}")
+                elif len(stash) >= STASH_MAX:
+                    print(f"⚠️  {STASH_MAX} messages en attente au plus / at most {STASH_MAX} waiting.")
+                elif len(arg.encode("utf-8")) > MAX_MESSAGE_FRAMES * PAYLOAD_MAX:
+                    print(f"⚠️  message trop long / too long ({MAX_MESSAGE_FRAMES * PAYLOAD_MAX} octets max).")
+                else:
+                    stash.append(arg)
+                    print(f"   📥 gardé ici ({len(stash)}/{STASH_MAX}), part dès qu'un correspondant "
+                          f"arrive / kept here, sent when someone comes online.")
+        elif name == "stashserver":
+            if arg.lower() == "cancel":
+                outbox.cancel_stash()
+                print("   🗑️  message laissé sur le serveur retiré (s'il n'a pas encore été lu) /\n"
+                      "      message left on the server removed (if not read yet).")
+            elif not arg:
+                print("   Usage : $/stashserver <message>  ·  $/stashserver cancel")
+            elif len(arg.encode("utf-8")) > STASH_SERVER_FRAMES * PAYLOAD_MAX:
+                print(f"⚠️  trop long pour le serveur / too long for the server "
+                      f"({STASH_SERVER_FRAMES * PAYLOAD_MAX} octets max).")
+            else:
+                outbox.put(codec.message(arg, (), box=True), CTL_STASH)
+                print("   📦 laissé sur le serveur : le prochain qui se connecte le recevra (un seul\n"
+                      "      message, remplace le précédent) / left on the server for the next one to\n"
+                      "      connect (one message, replaces the previous one).")
+        elif name == "selfdestruct":
+            if not arg:
+                lifecycle(lambda: box_api(key, "GET", "/lifecycle"))
+                return False
+            secs = parse_duration(arg)
+            if secs is None or secs < 60:
+                print("   Usage : $/selfdestruct <durée / duration>  (ex. 30m, 2h, 3d, 1d12h ; 1 min au moins)")
+                return False
+            lifecycle(lambda: box_api(key, "POST", "/selfdestruct", {"seconds": secs}))
+        elif name == "deadman":
+            deadman(arg)
+        elif name == "online":
+            n = len(inbox.recipients())
+            print(f"   {n} correspondant(s) en ligne / peer(s) online.")
+        elif name == "clear":
+            clear_screen()
+        elif name == "fingerprint":
+            print(f"   🔑 {key_fp}")
+            print("   Même empreinte des deux côtés = même clé (et même PIN).\n"
+                  "   Same fingerprint on both sides = same key (and same PIN).")
+        elif name in ("abort", "abort!"):
+            abort(confirm=(name == "abort"))
+        elif name in ("zeroize", "zeroize!"):
+            zeroize(confirm=(name == "zeroize"))
+        elif name == "options":
+            print(OPTIONS_TEXT)
+            with stash_lock:
+                waiting = len(stash)
+            print(f"   État / Status : {len(inbox.recipients())} en ligne / online · "
+                  f"{waiting} en attente ici / waiting here · {mode}")
+        else:
+            print(f"⚠️  commande inconnue / unknown command : {CMD_PREFIX}{name} — voir / see $/options")
+        return False
+
+    exiting = False
     try:
         while not stop.is_set():
             text = input("→ ")
@@ -1330,23 +1750,34 @@ def run_channel(key: Key, pin: str = "", e2e: bytes | None = None) -> int:
                 break
             if not text:
                 continue
+            if text.startswith(CMD_PREFIX):
+                if command(text):
+                    exiting = True
+                    break
+                continue
+            if text.startswith("$" + CMD_PREFIX):
+                text = text[1:]          # « $$/… » : message qui commence par « $/ »
             recipients = inbox.recipients()
             if not recipients:
-                print("⚠️  aucun correspondant en ligne : message non envoyé (rien n'est stocké).")
+                print("⚠️  aucun correspondant en ligne : message non envoyé (rien n'est stocké).\n"
+                      "    No peer online: not sent. « $/stash <message> » l'enverra à son arrivée / "
+                      "will send it when someone arrives.")
                 continue
-            try:
-                frames = codec.message(text, recipients)
-            except ValueError as exc:
-                print(f"⚠️  non envoyé : {exc}")
-                continue
-            outbox.put(frames)
-            if len(frames) > 1:
-                print(f"   (envoi en {len(frames)} trames, environ {len(frames) * TICK:.1f} s)")
+            send(text, recipients)
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
+        if exiting:  # $/exit : laisser partir les trames déjà en file (5 s au plus)
+            deadline = time.monotonic() + 5
+            while outbox.pending() and time.monotonic() < deadline and not fatal:
+                time.sleep(TICK)
         stop.set()
         up.join(2)
+    if exiting:
+        print("\nCanal fermé / Channel closed.")
+        sys.stdout.flush()
+        _close_console_window()
+        return 0
     if fatal:
         print(f"\n❌ {fatal[0]}")
         return 1

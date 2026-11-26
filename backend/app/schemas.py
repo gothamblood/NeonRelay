@@ -27,6 +27,34 @@ class TokenUpdate(BaseModel):
     response_delay_ms: Optional[int] = Field(default=None, ge=0, le=30_000)
 
 
+_DAY = 86_400
+
+
+class SelfDestructIn(BaseModel):
+    # $/selfdestruct : dans combien de secondes (1 min à 1 an).
+    seconds: int = Field(ge=60, le=365 * _DAY)
+
+
+class DeadmanIn(BaseModel):
+    # $/deadman <durée> <mot de passe> : armer, ou remettre le compteur à zéro.
+    seconds: int = Field(ge=60, le=365 * _DAY)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class DeadmanCancel(BaseModel):
+    password: str = Field(min_length=1, max_length=256)
+
+
+class LifecycleStatus(BaseModel):
+    # Secondes restantes avant destruction (selon l'heure du serveur), ou None.
+    destroy_in: Optional[int] = None
+    deadman_in: Optional[int] = None
+    deadman_armed: bool = False
+    # selfdestruct : "set" / "unchanged" (échéance déjà plus proche) ;
+    # deadman : "armed" / "reset" / "cancelled" / "not-armed" ; lecture : "status".
+    result: str = "status"
+
+
 class TokenPublic(BaseModel):
     id: str
     response_status: int

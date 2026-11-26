@@ -152,6 +152,10 @@ Each concern lives under its own prefix (no catch-all at the root):
 | GET | `/config/{id}` | 🔑 token | Token config |
 | PATCH | `/config/{id}` | 🔑 token | Change the response returned to senders |
 | DELETE | `/config/{id}` | 🔑 token | Delete the token |
+| GET | `/config/{id}/lifecycle` | 🔑 token | Seconds left before destruction (self-destruct, dead man) |
+| POST | `/config/{id}/selfdestruct` | 🔑 token | `{"seconds"}`: bring the destruction **forward** (never back) |
+| POST | `/config/{id}/deadman` | 🔑 token | `{"seconds","password"}`: arm the dead man, or reset its counter |
+| POST | `/config/{id}/deadman/cancel` | 🔑 token | `{"password"}`: disarm the dead man |
 | GET | `/listen/{id}` | 🔑 token | **SSE: listen live** (first receives any held `__stash` message) |
 | ANY | `/relay/{id}/{any/sub/path}` | 🔑 token | The relay: push the request live, then forget it |
 | ANY | `/relay/{id}/…?__stash=1` | 🔑 token | Relay **and hold** until the next listener if nobody is on now |
@@ -178,12 +182,31 @@ listener that connects** — then destroyed.
   the total memory ceiling is `(number of tokens) × cap`, and tokens are
   admin-created only. Nothing is ever written to disk.
 
+**Noisy channel (`/channel`) — `$/stashserver`.** The standalone client has its
+own stash: one end-to-end encrypted message per box (at most
+`NEONRELAY_CHANNEL_STASH_FRAMES` frames, default 8 ≈ 2.9 KB), held in memory and
+delivered to the next channel session that opens, then destroyed. Each upstream
+frame carries one control byte (relay / hold / cancel), so the wire size never
+changes; the server only learns that a message is waiting, never its content.
+See [client/README.md](client/README.md#commandes-de-la-console--console-commands).
+
 ### Token TTL (expiry)
 
 Create a token with `ttl_seconds` and it is rejected everywhere once that many
 seconds have passed, with **`410 Gone`** (relay, listen, config alike). Omit it
 (or `null`) for a token that never expires. `expires_at` is returned on create
-and on `GET /config/{id}`.
+and on `GET /config/{id}`. A sweeper then **destroys** expired tokens (row
+deleted, open streams cut) within ~5 s: afterwards they answer `401` like any
+unknown id.
+
+**Self-destruct and dead man (box holders, server clock).**
+`POST /config/{id}/selfdestruct` can only bring `expires_at` **forward**: a
+seized key can never extend a box's life. `POST /config/{id}/deadman` arms a
+dead-man switch with its own password (PBKDF2-hashed, distinct from the box
+password): unless someone resets the counter with that password before the
+deadline, the box is destroyed. Resetting or cancelling needs that password
+(5 tries, then 1 per minute). What the server stores on disk: the deadline and
+the hash — so it can infer when the counter was last reset.
 
 ```bash
 curl -u admin:pw -X POST .../config/tokens \

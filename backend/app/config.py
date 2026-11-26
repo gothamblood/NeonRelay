@@ -69,6 +69,9 @@ class Settings:
     # ouvrir des centaines de flux (bande passante et mémoire du serveur).
     CHANNEL_MAX_LISTENERS: int = int(os.getenv("NEONRELAY_CHANNEL_MAX_LISTENERS", 8))
     CHANNEL_MAX_SENDERS: int = int(os.getenv("NEONRELAY_CHANNEL_MAX_SENDERS", 8))
+    # $/stashserver : trames gardées par boîte pour la prochaine session (UN
+    # message, le dernier gagne ; 8 trames = ~2,9 Ko de texte, 4 Kio de RAM).
+    CHANNEL_STASH_FRAMES: int = int(os.getenv("NEONRELAY_CHANNEL_STASH_FRAMES", 8))
 
     # PBKDF2 iterations for password hashing.
     PBKDF2_ITERATIONS: int = int(os.getenv("NEONRELAY_PBKDF2_ITERATIONS", 200_000))

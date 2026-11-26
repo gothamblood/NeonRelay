@@ -43,3 +43,8 @@ async def _migrate(conn) -> None:
     # TTL column added later; back-fill it (NULL = never expires) on old DBs.
     if "expires_at" not in columns:
         await conn.execute(text("ALTER TABLE tokens ADD COLUMN expires_at DATETIME"))
+    # $/deadman (homme mort), ajouté après coup.
+    if "deadman_hash" not in columns:
+        await conn.execute(text("ALTER TABLE tokens ADD COLUMN deadman_hash VARCHAR(255)"))
+    if "deadman_deadline" not in columns:
+        await conn.execute(text("ALTER TABLE tokens ADD COLUMN deadman_deadline DATETIME"))

@@ -70,6 +70,43 @@ class Stash:
         return token_id in self._slots
 
 
+class ChannelStash:
+    """$/stashserver : UN message par boîte (des trames chiffrées de bout en bout,
+    opaques pour le serveur) gardé en mémoire jusqu'à la prochaine session du
+    canal, puis détruit. Le dernier dépôt écrase le précédent. Rien sur disque.
+
+    Le slot retient l'identifiant de la session qui dépose : une reconnexion de
+    CETTE session ne le consomme pas, et elle seule peut le compléter (message
+    de plusieurs trames). Une autre session (y compris une relance du même
+    client, qui tire un nouvel identifiant) le reçoit.
+    """
+
+    def __init__(self) -> None:
+        self._slots: dict[str, tuple[str, list[bytes]]] = {}
+
+    def start(self, token_id: str, session: str, frame: bytes) -> None:
+        self._slots[token_id] = (session, [frame])
+
+    def extend(self, token_id: str, session: str, frame: bytes, max_frames: int) -> bool:
+        slot = self._slots.get(token_id)
+        if slot is None or slot[0] != session or len(slot[1]) >= max_frames:
+            return False
+        slot[1].append(frame)
+        return True
+
+    def pop_for(self, token_id: str, session: str) -> list[bytes]:
+        """Trames gardées pour une session qui s'ouvre (vide si rien, ou si c'est
+        la session qui les a déposées). Le slot est détruit."""
+        slot = self._slots.get(token_id)
+        if slot is None or slot[0] == session:
+            return []
+        del self._slots[token_id]
+        return slot[1]
+
+    def clear(self, token_id: str) -> None:
+        self._slots.pop(token_id, None)
+
+
 class Revocations:
     """Boîtes supprimées pendant que des flux sont ouverts (canal, /listen).
 
@@ -99,4 +136,5 @@ class Revocations:
 
 broker = EventBroker()
 stash = Stash()
+channel_stash = ChannelStash()
 revocations = Revocations()

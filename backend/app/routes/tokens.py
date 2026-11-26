@@ -8,20 +8,22 @@ There is no request-history endpoint -- nothing is stored."""
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..admin import require_admin
 from ..auth import authenticate_token
-from ..database import get_session
-from ..events import broker, revocations, stash
+from ..database import SessionLocal, get_session
+from ..events import broker, channel_stash, revocations, stash
 from ..logging_setup import log_action
 from ..models import Token
-from ..ratelimit import limiter
-from ..schemas import TokenCreate, TokenCreated, TokenPublic, TokenUpdate
-from ..security import generate_password, hash_password
+from ..ratelimit import RateLimiter, limiter
+from ..schemas import (DeadmanCancel, DeadmanIn, LifecycleStatus, SelfDestructIn, TokenCreate,
+                       TokenCreated, TokenPublic, TokenUpdate)
+from ..security import generate_password, hash_password, verify_password
 
 # Managing a token (create / inspect / update / delete).
 config_router = APIRouter(prefix="/config", tags=["config"])
@@ -78,6 +80,144 @@ async def update_token(
     return TokenPublic.model_validate(token, from_attributes=True)
 
 
+# ---------------------------------------------------------------------------
+# Fin de vie d'une boîte : $/selfdestruct (compte à rebours) et $/deadman
+# (homme mort). L'heure qui compte est celle du SERVEUR. Un balayeur détruit
+# réellement les boîtes échues (ligne supprimée, flux ouverts coupés).
+# ---------------------------------------------------------------------------
+
+# Mot de passe de l'homme mort : 5 essais, puis 1 par minute (en plus de PBKDF2).
+deadman_limiter = RateLimiter(1 / 60, 5, 3600)
+_DEADMAN_REFUSED = HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Wrong deadman password.")
+
+
+def _seconds_until(dt) -> int | None:
+    if dt is None:
+        return None
+    dt = Token._aware(dt)
+    return max(0, int((dt - datetime.now(timezone.utc)).total_seconds()))
+
+
+def _status(token: Token, result: str = "status") -> LifecycleStatus:
+    return LifecycleStatus(
+        destroy_in=_seconds_until(token.expires_at),
+        deadman_in=_seconds_until(token.deadman_deadline),
+        deadman_armed=token.deadman_hash is not None,
+        result=result,
+    )
+
+
+async def _check_deadman_password(token: Token, password: str) -> None:
+    retry = deadman_limiter.check(token.id)
+    if retry:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too many attempts.", headers={"Retry-After": str(int(retry))})
+    if not await asyncio.to_thread(verify_password, password, token.deadman_hash):
+        log_action("token.deadman.refused")
+        raise _DEADMAN_REFUSED
+
+
+@config_router.get("/{token_id}/lifecycle", response_model=LifecycleStatus)
+async def lifecycle_status(token: Token = Depends(authenticate_token)):
+    return _status(token)
+
+
+@config_router.post("/{token_id}/selfdestruct", response_model=LifecycleStatus)
+async def self_destruct(
+    payload: SelfDestructIn,
+    token: Token = Depends(authenticate_token),
+    session: AsyncSession = Depends(get_session),
+):
+    """Avance l'échéance de la boîte. Ne la recule JAMAIS : une clé saisie ne
+    peut pas prolonger la vie d'une boîte (seul l'admin le pourrait)."""
+    when = datetime.now(timezone.utc) + timedelta(seconds=payload.seconds)
+    current = Token._aware(token.expires_at)
+    if current is not None and current <= when:
+        return _status(token, "unchanged")
+    token.expires_at = when
+    session.add(token)
+    await session.commit()
+    log_action("token.selfdestruct")
+    return _status(token, "set")
+
+
+@config_router.post("/{token_id}/deadman", response_model=LifecycleStatus)
+async def deadman_arm_or_reset(
+    payload: DeadmanIn,
+    token: Token = Depends(authenticate_token),
+    session: AsyncSession = Depends(get_session),
+):
+    """Arme l'homme mort, ou (même mot de passe) remet le compteur à zéro."""
+    if token.deadman_hash is None:
+        token.deadman_hash = await asyncio.to_thread(hash_password, payload.password)
+        result = "armed"
+    else:
+        await _check_deadman_password(token, payload.password)
+        result = "reset"
+    token.deadman_deadline = datetime.now(timezone.utc) + timedelta(seconds=payload.seconds)
+    session.add(token)
+    await session.commit()
+    log_action(f"token.deadman.{result}")
+    return _status(token, result)
+
+
+@config_router.post("/{token_id}/deadman/cancel", response_model=LifecycleStatus)
+async def deadman_cancel(
+    payload: DeadmanCancel,
+    token: Token = Depends(authenticate_token),
+    session: AsyncSession = Depends(get_session),
+):
+    if token.deadman_hash is None:
+        return _status(token, "not-armed")
+    await _check_deadman_password(token, payload.password)
+    token.deadman_hash = None
+    token.deadman_deadline = None
+    session.add(token)
+    await session.commit()
+    log_action("token.deadman.cancelled")
+    return _status(token, "cancelled")
+
+
+def _forget_box(token_id: str) -> None:
+    """Tout ce qui vit en mémoire pour une boîte détruite ; ses flux ouverts se
+    ferment au tic suivant."""
+    stash.clear(token_id)
+    channel_stash.clear(token_id)
+    limiter.forget(token_id)
+    deadman_limiter.forget(token_id)
+    revocations.revoke(token_id)
+
+
+SWEEP_SECONDS = 5
+
+
+async def sweep_expired() -> int:
+    """Détruit les boîtes dont l'échéance est passée (TTL, $/selfdestruct,
+    $/deadman). Renvoie le nombre de boîtes détruites."""
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(Token).where(
+            or_(Token.expires_at.is_not(None), Token.deadman_deadline.is_not(None))
+        ))).scalars().all()
+        dead = [t for t in rows if t.is_expired()]
+        for t in dead:
+            await session.delete(t)
+        if dead:
+            await session.commit()
+    for t in dead:
+        _forget_box(t.id)
+        log_action("token.destroyed")
+    return len(dead)
+
+
+async def sweep_loop() -> None:
+    while True:
+        try:
+            await sweep_expired()
+        except Exception as exc:  # jamais d'arrêt du balayeur
+            log_action("sweep.error", error=type(exc).__name__)
+        await asyncio.sleep(SWEEP_SECONDS)
+
+
 @config_router.delete("/{token_id}", status_code=204)
 async def delete_token(
     token: Token = Depends(authenticate_token),
@@ -85,9 +225,7 @@ async def delete_token(
 ):
     await session.delete(token)
     await session.commit()
-    stash.clear(token.id)
-    limiter.forget(token.id)
-    revocations.revoke(token.id)  # ferme les flux déjà ouverts (canal, /listen)
+    _forget_box(token.id)  # ferme aussi les flux déjà ouverts (canal, /listen)
     log_action("token.delete")
 
 
